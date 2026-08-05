@@ -131,12 +131,24 @@ mod imp {
     /// less for cleanup and the dictionary to fix downstream).
     fn model_path() -> PathBuf {
         let dir = support_dir().join("models");
+        // Ordered for LATENCY, not raw accuracy — measured 2026-08-05, see
+        // orientation.md. Whisper pads every clip to a 30-second window and runs the
+        // encoder over all of it, so ASR time is set by model size and is essentially
+        // independent of how briefly you actually spoke: large-v3-turbo costs ~2.7s
+        // per dictation on an M2 Air whether the clip is 2s or 9s. small.en's encoder
+        // is roughly 7x smaller, which is what makes sub-second dictation possible.
+        //
+        // The "-dev" suffixes are deliberate. Both apps share this models directory by
+        // symlink, and the stable app's compiled list ranks a plain "ggml-small.en.bin"
+        // ABOVE base.en — so dropping one in under its canonical name would silently
+        // change which model the stable app loads. Dev-only filenames keep that from
+        // happening. Rename a file to its canonical name only if you also want the
+        // stable app to pick it up.
         for name in [
+            // Speed-first default.
+            "ggml-small.en-dev.bin",
+            // Accuracy-first fallbacks, kept for easy A/B by renaming on disk.
             "ggml-large-v3-turbo.bin",
-            // Quantized turbo: ~547 MB vs 1.5 GB for roughly a 1% WER penalty — the
-            // right default on a fanless MacBook Air. Listed only here (not in the
-            // stable app), so the shared models dir can hold it without changing
-            // which model the stable app loads.
             "ggml-large-v3-turbo-q5_0.bin",
             "ggml-medium.en.bin",
             "ggml-small.en.bin",
@@ -345,6 +357,16 @@ mod imp {
         let raw_norm = whimpr_core::cleanup::pre_normalize_layout(raw);
         let raw = raw_norm.as_str();
         let raw_out = whimpr_core::cleanup::post_process(&raw_norm);
+        // Skip the model entirely when the transcript shows no evidence of the mess
+        // cleanup exists to fix. The LLM call costs ~2s on an M2 Air regardless of how
+        // short the input is (it is almost all fixed prompt prefill), and Whisper
+        // already emits punctuated, filler-free text for most short dictations — so
+        // paying that toll unconditionally was the single largest avoidable component
+        // of end-to-end latency. Deterministic post-processing still runs.
+        if !whimpr_core::cleanup::needs_cleanup(raw) {
+            eprintln!("[whimpr] cleanup skipped — transcript already clean");
+            return raw_out;
+        }
         let vocab = DICTIONARY
             .get()
             .map(|d| d.lock().unwrap().prefilter(raw, 15))
@@ -514,20 +536,40 @@ mod imp {
                         finish();
                         return;
                     };
+                    // Per-stage timing. Everything here is serial after key release, so
+                    // this is exactly the latency the user waits through before text
+                    // appears — the number to optimize against.
+                    let t_start = Instant::now();
                     let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
+                    let ms_resample = t_start.elapsed().as_millis();
+                    let t_asr = Instant::now();
                     match asr.transcribe(&pcm) {
                         Ok(t) => {
+                            let ms_asr = t_asr.elapsed().as_millis();
                             let raw = t.text;
                             eprintln!("[whimpr] TRANSCRIPT: \"{}\"", raw);
                             // Clean the transcript (cloud LLM if configured), then paste.
+                            let t_clean = Instant::now();
                             let text = clean_transcript(&raw);
+                            let ms_clean = t_clean.elapsed().as_millis();
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
                             }
                             if !text.is_empty() {
+                                let t_paste = Instant::now();
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
                                 }
+                                eprintln!(
+                                    "[whimpr] ⏱ audio {:.1}s | resample {}ms | asr {}ms | \
+                                     cleanup {}ms | paste {}ms | TOTAL {}ms",
+                                    res.duration_secs(),
+                                    ms_resample,
+                                    ms_asr,
+                                    ms_clean,
+                                    t_paste.elapsed().as_millis(),
+                                    t_start.elapsed().as_millis(),
+                                );
                                 // Log words + speaking time for the Hub stats (WPM, streak…).
                                 record_dictation(&text, res.duration_secs());
                                 // Watch the field for a post-paste correction to learn (✨).

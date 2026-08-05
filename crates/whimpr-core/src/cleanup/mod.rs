@@ -10,7 +10,7 @@ pub mod gates;
 pub mod levels;
 pub mod prompts;
 
-pub use gates::{evaluate as evaluate_gates, GateReason, GateVerdict};
+pub use gates::{evaluate as evaluate_gates, needs_cleanup, GateReason, GateVerdict};
 pub use levels::CleanupLevel;
 
 use serde::{Deserialize, Serialize};

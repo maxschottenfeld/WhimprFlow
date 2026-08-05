@@ -108,10 +108,18 @@ mod imp {
         // Give the pasteboard a moment to settle before the paste keystroke.
         std::thread::sleep(Duration::from_millis(60));
         post_cmd_v();
-        // Let the target consume the paste before we restore the old clipboard.
-        std::thread::sleep(Duration::from_millis(150));
+        // The text is in the target app the moment Cmd+V is posted — everything after
+        // this point is bookkeeping the user should never wait on. Restoring the
+        // previous clipboard still has to wait for the target to consume the paste,
+        // but that wait belongs on a background thread: blocking here charged ~150ms
+        // to every single dictation for work the user cannot observe.
         if let Some(prev) = saved {
-            let _ = cb.set_text(prev);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                if let Ok(mut cb) = Clipboard::new() {
+                    let _ = cb.set_text(prev);
+                }
+            });
         }
         Ok(())
     }

@@ -5,6 +5,66 @@
 
 use super::levels::CleanupLevel;
 
+/// Spoken-only artifacts that the LLM cleanup pass exists to remove. Matched as
+/// whole words, case-insensitively. Deliberately excludes words that are ordinary
+/// in written English ("like", "so", "well", "right") — those appear constantly in
+/// clean dictation, and treating them as evidence of mess would send almost
+/// everything to the model and defeat the point of the gate.
+const CLEANUP_SIGNALS: &[&str] = &[
+    "um", "uh", "erm", "uhh", "umm", "hmm", "mmm", "er", "ah",
+];
+
+/// Phrases that signal the speaker corrected themselves mid-sentence — the other
+/// thing cleanup is genuinely needed for.
+const SELF_CORRECTION_SIGNALS: &[&str] = &[
+    "i mean", "sorry", "actually no", "scratch that", "no wait", "rather",
+];
+
+/// Whether a raw transcript plausibly benefits from the LLM cleanup pass.
+///
+/// The cleanup model costs roughly two seconds per call on an M2 Air, essentially
+/// all of it prefilling the fixed system prompt and few-shot examples — a cost that
+/// does not shrink for a short, already-clean sentence. Most dictation is short and
+/// already clean (Whisper emits well-punctuated text on its own), so paying that
+/// toll unconditionally is what put every dictation over five seconds.
+///
+/// This is deliberately a cheap, conservative pre-filter, not a quality judgement:
+/// it answers "is there visible evidence of the mess cleanup fixes?" and nothing
+/// more. False negatives (skipping when cleanup would have helped a little) cost
+/// polish; false positives only cost latency. When in doubt it returns true.
+pub fn needs_cleanup(raw: &str) -> bool {
+    let lower = raw.to_lowercase();
+
+    // Self-corrections: cheapest check, and the highest-value case to catch.
+    if SELF_CORRECTION_SIGNALS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    let words: Vec<&str> = lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    // Disfluencies.
+    if words.iter().any(|w| CLEANUP_SIGNALS.contains(w)) {
+        return true;
+    }
+
+    // Stutters / duplicated words ("the the", "I I").
+    if words.windows(2).any(|w| w[0] == w[1]) {
+        return true;
+    }
+
+    // Long utterances: more chance of structure worth fixing, and the fixed cleanup
+    // cost is proportionally smaller against an already-long transcription.
+    if words.len() > 60 {
+        return true;
+    }
+
+    false
+}
+
 /// Why a cleanup output was rejected.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateReason {
@@ -202,5 +262,50 @@ mod tests {
     #[test]
     fn none_level_always_passes() {
         assert!(evaluate("anything", "totally different", CleanupLevel::None).passed());
+    }
+}
+
+#[cfg(test)]
+mod needs_cleanup_tests {
+    use super::needs_cleanup;
+
+    #[test]
+    fn skips_short_clean_sentences() {
+        // The common case: Whisper already emits punctuated, filler-free text.
+        assert!(!needs_cleanup("Okay, here's a short sentence reply."));
+        assert!(!needs_cleanup("Let's meet at four tomorrow."));
+        assert!(!needs_cleanup("The build finished and all tests passed."));
+    }
+
+    #[test]
+    fn catches_disfluencies() {
+        assert!(needs_cleanup("um so I was thinking we should meet"));
+        assert!(needs_cleanup("that's uh probably fine"));
+    }
+
+    #[test]
+    fn catches_self_corrections() {
+        assert!(needs_cleanup("meet at 3 p.m. I'm sorry. I mean 4 p.m."));
+        assert!(needs_cleanup("send it to Bob, actually no, send it to Alice"));
+    }
+
+    #[test]
+    fn catches_stutters() {
+        assert!(needs_cleanup("go over the the budget"));
+    }
+
+    #[test]
+    fn does_not_fire_on_ordinary_written_words() {
+        // "like", "so", "well", "right" are normal English — treating them as mess
+        // would route nearly everything to the model and defeat the gate.
+        assert!(!needs_cleanup("I would like to review the design doc."));
+        assert!(!needs_cleanup("So the answer is right there in the logs."));
+        assert!(!needs_cleanup("That went well, all things considered."));
+    }
+
+    #[test]
+    fn long_transcripts_still_get_cleanup() {
+        let long = "word ".repeat(70);
+        assert!(needs_cleanup(&long));
     }
 }
