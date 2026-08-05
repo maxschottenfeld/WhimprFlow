@@ -184,23 +184,94 @@ where
     }
 }
 
-/// Resample mono `input` from `src_rate` to 16 kHz (what ASR models expect) using
-/// linear interpolation. Adequate for speech recognition; a polyphase resampler is
-/// a later refinement. Returns `input` unchanged when already at 16 kHz.
+/// Cutoff for the anti-alias filter, comfortably under the 8 kHz Nyquist of the
+/// 16 kHz target. Speech carries very little above this, and backing off from 8 kHz
+/// buys a usable transition band without needing a huge number of taps.
+const ANTIALIAS_CUTOFF_HZ: f32 = 7_000.0;
+/// Odd so the kernel is symmetric about an integer center (linear phase — no group
+/// delay to compensate for).
+const ANTIALIAS_TAPS: usize = 81;
+
+/// Windowed-sinc low-pass FIR (Hamming window), normalized to unity DC gain.
+fn lowpass_kernel(cutoff_hz: f32, sample_rate: u32, taps: usize) -> Vec<f32> {
+    let fc = (cutoff_hz / sample_rate as f32).min(0.5); // cycles/sample
+    let center = (taps / 2) as f32;
+    let mut k: Vec<f32> = (0..taps)
+        .map(|i| {
+            let n = i as f32 - center;
+            // sinc(2*fc*n), with the removable singularity at n == 0 handled.
+            let sinc = if n == 0.0 {
+                2.0 * fc
+            } else {
+                (2.0 * std::f32::consts::PI * fc * n).sin() / (std::f32::consts::PI * n)
+            };
+            let w = 0.54
+                - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / (taps - 1) as f32).cos();
+            sinc * w
+        })
+        .collect();
+    let sum: f32 = k.iter().sum();
+    if sum != 0.0 {
+        for v in &mut k {
+            *v /= sum;
+        }
+    }
+    k
+}
+
+/// Zero-padded "same"-length convolution, centered so the output stays time-aligned.
+fn convolve_same(input: &[f32], kernel: &[f32]) -> Vec<f32> {
+    let half = kernel.len() / 2;
+    (0..input.len())
+        .map(|i| {
+            let mut acc = 0.0f32;
+            for (j, &k) in kernel.iter().enumerate() {
+                let idx = i as isize + j as isize - half as isize;
+                if idx >= 0 && (idx as usize) < input.len() {
+                    acc += input[idx as usize] * k;
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+/// Resample mono `input` from `src_rate` to 16 kHz (what ASR models expect).
+///
+/// Downsampling low-passes first. Dropping 48 kHz straight to 16 kHz by
+/// interpolation alone lets everything above 8 kHz fold back down into the speech
+/// band as aliasing distortion — sibilants and fricatives (s, sh, f, th) carry
+/// much of their energy up there, so the audible result is smeared consonants and
+/// mis-heard words. Band-limiting first removes the content that would fold;
+/// linear interpolation is then adequate, because the signal it interpolates no
+/// longer contains the high frequencies that made it inaccurate.
+///
+/// Upsampling needs no filter (no content above the source Nyquist to fold), and a
+/// rate that already matches is returned unchanged.
 pub fn resample_to_16k(input: &[f32], src_rate: u32) -> Vec<f32> {
     const DST: u32 = 16_000;
     if src_rate == DST || src_rate == 0 || input.is_empty() {
         return input.to_vec();
     }
+
+    let filtered;
+    let src: &[f32] = if src_rate > DST {
+        let kernel = lowpass_kernel(ANTIALIAS_CUTOFF_HZ, src_rate, ANTIALIAS_TAPS);
+        filtered = convolve_same(input, &kernel);
+        &filtered
+    } else {
+        input
+    };
+
     let ratio = DST as f64 / src_rate as f64;
-    let out_len = ((input.len() as f64) * ratio).round() as usize;
+    let out_len = ((src.len() as f64) * ratio).round() as usize;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = i as f64 / ratio;
         let idx = src_pos.floor() as usize;
         let frac = (src_pos - idx as f64) as f32;
-        let a = input.get(idx).copied().unwrap_or(0.0);
-        let b = input.get(idx + 1).copied().unwrap_or(a);
+        let a = src.get(idx).copied().unwrap_or(0.0);
+        let b = src.get(idx + 1).copied().unwrap_or(a);
         out.push(a + (b - a) * frac);
     }
     out
@@ -221,5 +292,48 @@ mod tests {
     fn resample_noop_at_16k() {
         let input = vec![0.1f32, 0.2, 0.3];
         assert_eq!(resample_to_16k(&input, 16_000), input);
+    }
+
+    fn tone(freq: f32, rate: u32, secs: f32) -> Vec<f32> {
+        let n = (rate as f32 * secs) as usize;
+        (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        if x.is_empty() {
+            return 0.0;
+        }
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    /// The actual anti-aliasing guarantee. A 12 kHz tone sampled at 48 kHz is above
+    /// the 8 kHz Nyquist of the 16 kHz target, so naive decimation folds it down to
+    /// |12000 - 16000| = 4 kHz — a loud phantom tone sitting in the middle of the
+    /// speech band. With the low-pass in place it should be attenuated to near
+    /// silence instead. Trimmed at both ends to ignore filter edge transients.
+    #[test]
+    fn rejects_above_nyquist_instead_of_aliasing_it() {
+        let out = resample_to_16k(&tone(12_000.0, 48_000, 0.25), 48_000);
+        let body = &out[out.len() / 8..out.len() * 7 / 8];
+        assert!(
+            rms(body) < 0.05,
+            "12 kHz tone should be filtered out, not aliased into the speech band \
+             (got RMS {:.4}; unfiltered decimation yields ~0.7)",
+            rms(body)
+        );
+    }
+
+    /// The filter must not eat ordinary speech-band content while doing that.
+    #[test]
+    fn preserves_speech_band_content() {
+        let out = resample_to_16k(&tone(1_000.0, 48_000, 0.25), 48_000);
+        let body = &out[out.len() / 8..out.len() * 7 / 8];
+        assert!(
+            rms(body) > 0.6,
+            "1 kHz tone should pass essentially untouched (got RMS {:.4}, expected ~0.707)",
+            rms(body)
+        );
     }
 }

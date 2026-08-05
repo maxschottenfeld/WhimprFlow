@@ -40,7 +40,16 @@ impl AsrEngine for WhisperEngine {
             .create_state()
             .map_err(|e| anyhow::anyhow!("whisper create_state: {e}"))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // Beam search rather than greedy. whisper.cpp defaults to greedy (best_of 1),
+        // but OpenAI's reference implementation uses beam search — it evaluates several
+        // candidate token paths and picks the best overall sequence instead of
+        // committing to the highest-probability token at each step. That is exactly the
+        // class of error that produces plausible-but-wrong words. beam_size 5 matches
+        // the reference default; the extra cost is negligible on push-to-talk clips.
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: 0.0,
+        });
         params.set_language(Some("en"));
         params.set_translate(false);
         params.set_print_special(false);

@@ -133,6 +133,11 @@ mod imp {
         let dir = support_dir().join("models");
         for name in [
             "ggml-large-v3-turbo.bin",
+            // Quantized turbo: ~547 MB vs 1.5 GB for roughly a 1% WER penalty — the
+            // right default on a fanless MacBook Air. Listed only here (not in the
+            // stable app), so the shared models dir can hold it without changing
+            // which model the stable app loads.
+            "ggml-large-v3-turbo-q5_0.bin",
             "ggml-medium.en.bin",
             "ggml-small.en.bin",
             "ggml-base.en.bin",
