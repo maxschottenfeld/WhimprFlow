@@ -160,7 +160,7 @@ export function Onboarding({
         <Step
           n={1}
           title="Accessibility"
-          detail="Detects the Right Option key in every app and types your words. This is the one that makes the hotkey work everywhere."
+          detail="Detects the Fn key in every app and types your words. This is the one that makes the Fn key work everywhere."
           done={acc}
           active={!acc}
           locked={false}

@@ -84,12 +84,9 @@ mod imp {
     const K_CG_TAP_OPTION_LISTEN_ONLY: u32 = 1;
     const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
     const EVENTS_OF_INTEREST: u64 = 1 << K_CG_EVENT_FLAGS_CHANGED;
-    // WhimprFlow Dev binds Right Option instead of Fn, so it can run side-by-side
-    // with the stable /Applications/WhimprFlow.app without fighting over the same
-    // physical key. See memory/projects/WhimprFlow/project.md, Phase 0.
-    const FLAG_HOTKEY_MODIFIER: u64 = 0x0008_0000; // kCGEventFlagMaskAlternate (Option)
+    const FLAG_HOTKEY_MODIFIER: u64 = 0x0080_0000; // kCGEventFlagMaskSecondaryFn
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
-    const KEYCODE_HOTKEY: i64 = 61; // kVK_RightOption
+    const KEYCODE_HOTKEY: i64 = 63; // kVK_Function (Fn)
     const K_CG_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
     const K_CG_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
@@ -162,12 +159,9 @@ mod imp {
         dir.join("ggml-base.en.bin")
     }
 
-    // WhimprFlow Dev uses its own app-support dir so it never reads/writes the
-    // stable app's dictionary, stats, or settings. Models are symlinked in
-    // (Phase 0 step 4) rather than duplicated. See project.md, Phase 0.
     fn support_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join("Library/Application Support/WhimprFlow Dev")
+        PathBuf::from(home).join("Library/Application Support/WhimprFlow")
     }
     fn settings_path() -> PathBuf {
         support_dir().join("settings.json")
@@ -279,7 +273,7 @@ mod imp {
                 return Some(k);
             }
         }
-        keyring::Entry::new("com.whimpr.whimprflow.dev", account)
+        keyring::Entry::new("com.whimpr.whimprflow", account)
             .ok()
             .and_then(|e| e.get_password().ok())
             .map(|k| k.trim().to_string())
@@ -622,7 +616,7 @@ mod imp {
                 let was_down = FN_IS_DOWN.swap(down, Ordering::SeqCst);
                 let at_ms = now_ms();
                 if down && !was_down {
-                    eprintln!("[whimpr] Right Option DOWN");
+                    eprintln!("[whimpr] Fn DOWN");
                     // Snapshot the paste target now, while the user's app is focused.
                     let target = crate::appctx::frontmost_bundle_id();
                     *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;
@@ -631,7 +625,7 @@ mod imp {
                         at_ms,
                     }));
                 } else if !down && was_down {
-                    eprintln!("[whimpr] Right Option UP");
+                    eprintln!("[whimpr] Fn UP");
                     handle_input(Input::Trigger(TriggerToken::Up {
                         binding: BindingId::PushToTalk,
                         at_ms,
@@ -687,11 +681,11 @@ mod imp {
         // silently limited to frontmost-only — the exact bug. Prompt for it up front.
         if crate::paste::is_trusted() {
             eprintln!(
-                "[whimpr] Accessibility granted — Right Option works in every app, paste enabled"
+                "[whimpr] Accessibility granted — Fn works in every app, paste enabled"
             );
         } else {
             eprintln!(
-                "[whimpr] ⚠ Accessibility NOT granted — Right Option only works while WhimprFlow \
+                "[whimpr] ⚠ Accessibility NOT granted — Fn only works while WhimprFlow \
                  is frontmost and paste is disabled. Prompting; grant WhimprFlow under System \
                  Settings → Privacy & Security → Accessibility (no relaunch needed)."
             );
@@ -719,7 +713,7 @@ mod imp {
             while !crate::paste::is_trusted() {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            eprintln!("[whimpr] Accessibility present — creating global Right Option tap");
+            eprintln!("[whimpr] Accessibility present — creating global Fn tap");
             let port = unsafe {
                 CGEventTapCreate(
                     K_CG_SESSION_EVENT_TAP,
@@ -734,7 +728,7 @@ mod imp {
                 eprintln!(
                     "[whimpr] Hotkey tap null despite Accessibility — likely a stale TCC entry \
                      from an earlier build. Run: tccutil reset Accessibility \
-                     com.whimpr.whimprflow.dev, then re-grant and relaunch."
+                     com.whimpr.whimprflow, then re-grant and relaunch."
                 );
                 return;
             }
