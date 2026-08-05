@@ -11,6 +11,7 @@ use std::num::NonZeroU32;
 
 use anyhow::Context as _;
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -59,6 +60,16 @@ fn main() -> anyhow::Result<()> {
     let model_params = LlamaModelParams::default().with_n_gpu_layers(999);
     let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
         .with_context(|| format!("failed to load model {model_path}"))?;
+    // Build the context ONCE and reuse it for every request. Creating it per
+    // request meant each cleanup allocated a ~300 MB Metal compute buffer, compiled
+    // the Metal pipelines, then freed it all again — pure overhead repeated on
+    // every single dictation, and the dominant source of perceived latency.
+    // The KV cache is cleared per request instead, which is what actually needs
+    // resetting between independent utterances.
+    let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(4096));
+    let mut ctx = model
+        .new_context(&backend, ctx_params)
+        .context("failed to create llama context")?;
     eprintln!("[llm-worker] model loaded, ready");
 
     let stdin = std::io::stdin();
@@ -69,7 +80,7 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => match generate(&backend, &model, &req) {
+            Ok(req) => match generate(&mut ctx, &model, &req) {
                 Ok(text) => Response { text, error: None },
                 Err(e) => Response {
                     text: String::new(),
@@ -88,7 +99,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn generate(backend: &LlamaBackend, model: &LlamaModel, req: &Request) -> anyhow::Result<String> {
+fn generate(
+    ctx: &mut LlamaContext,
+    model: &LlamaModel,
+    req: &Request,
+) -> anyhow::Result<String> {
     // Qwen2.5 ChatML template. Prefer the full multi-turn message list (few-shot
     // demonstrations drive the newline/list/self-correction behavior); fall back
     // to the legacy single system+user pair.
@@ -105,8 +120,9 @@ fn generate(backend: &LlamaBackend, model: &LlamaModel, req: &Request) -> anyhow
     }
     prompt.push_str("<|im_start|>assistant\n");
 
-    let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(4096));
-    let mut ctx = model.new_context(backend, ctx_params)?;
+    // Independent utterance: drop the previous request's tokens so this prompt
+    // starts from an empty cache in the reused context.
+    ctx.clear_kv_cache();
 
     let tokens = model.str_to_token(&prompt, AddBos::Always)?;
     let n_prompt = tokens.len() as i32;
