@@ -743,13 +743,13 @@ mod imp {
             while !crate::paste::is_trusted() {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            eprintln!("[whimpr] Accessibility present — creating global Right Option tap");
+            eprintln!("[whimpr] Accessibility present — creating global Fn tap");
 
             // Retry rather than give up. AXIsProcessTrusted() flipping true and the
             // process actually being allowed to create a keyboard tap are not the
             // same instant, so the first attempt after a fresh grant can return null
             // on a race. This used to `return`, killing the hotkey until the app was
-            // relaunched — which matches the recurring "Right Option opens the
+            // relaunched — which matches the recurring "Fn opens the
             // overlay but nothing completes, and a clean relaunch fixes it" reports
             // better than anything else in this file.
             //
@@ -776,7 +776,7 @@ mod imp {
                             "[whimpr] ⚠ hotkey tap null despite Accessibility (attempt {attempt}) \
                              — retrying. If this persists, a stale TCC entry from an earlier \
                              build is the usual cause: run `tccutil reset Accessibility \
-                             com.whimpr.whimprflow.dev`, re-grant, and relaunch."
+                             com.whimpr.whimprflow`, re-grant, and relaunch."
                         );
                     }
                     std::thread::sleep(Duration::from_millis(
