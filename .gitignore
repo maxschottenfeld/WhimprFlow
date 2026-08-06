@@ -31,3 +31,6 @@ src-tauri/gen/
 /fixtures/
 # Overnight-run scratch files.
 /OVERNIGHT-*.md
+
+# Staged by scripts/build-worker.sh for Tauri externalBin (a build artifact).
+/src-tauri/binaries/
