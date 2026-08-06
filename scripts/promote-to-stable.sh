@@ -164,7 +164,12 @@ echo "    CFBundleName       = $NAME"
   || fail "cleanup worker is not bundled -- local cleanup would silently be off"
 echo "    cleanup worker bundled"
 
-if codesign -dv "$BUILT_APP" 2>&1 | grep -q 'Signature=adhoc'; then
+# Capture first, then match. `codesign -dv` exits non-zero even on success, and
+# under `set -o pipefail` that fails the whole pipeline no matter what grep found
+# -- which inverted this check and cheerfully reported an ad-hoc build as properly
+# signed. That is the one place a false positive is genuinely harmful here.
+SIGINFO=$(codesign -dv "$BUILT_APP" 2>&1 || true)
+if printf '%s' "$SIGINFO" | grep -q 'Signature=adhoc'; then
   echo "    ⚠ WARNING: build is ad-hoc signed. macOS will drop its Accessibility"
   echo "      grant on the next rebuild and the app will prompt again. If a keychain"
   echo "      dialog appeared during the build, answer it with 'Always Allow' and"
