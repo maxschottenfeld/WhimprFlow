@@ -31,6 +31,15 @@ pub struct RunOpts {
     /// stop after one window's worth of output. Exposed here so the harness can
     /// answer that against real audio instead of by reading whisper.cpp.
     pub single_segment: bool,
+    /// Override whisper's encoder context length (`n_audio_ctx`, default 1500 =
+    /// 30 seconds at 50 frames/sec).
+    ///
+    /// Whisper pads every clip to a full 30-second window and runs the encoder over
+    /// all of it, which is why ASR time tracks model size rather than clip length.
+    /// Shrinking this makes the encoder skip the padding — the single largest
+    /// latency lever available that is not a model change. Accuracy degrades if it
+    /// is set below what the real audio needs, so it must be measured, not assumed.
+    pub audio_ctx: Option<i32>,
 }
 
 impl Default for RunOpts {
@@ -38,6 +47,7 @@ impl Default for RunOpts {
         Self {
             prompt: None,
             single_segment: true,
+            audio_ctx: None,
         }
     }
 }
@@ -131,7 +141,7 @@ impl WhisperEngine {
         opts: &RunOpts,
     ) -> anyhow::Result<Transcript> {
         let fitted = opts.prompt.as_deref().and_then(|p| self.fit_prompt(p));
-        self.run(pcm16k, fitted.as_deref(), opts.single_segment)
+        self.run(pcm16k, fitted.as_deref(), opts.single_segment, opts.audio_ctx)
     }
 
     fn run(
@@ -139,6 +149,7 @@ impl WhisperEngine {
         pcm16k: &[f32],
         prompt: Option<&str>,
         single_segment: bool,
+        audio_ctx: Option<i32>,
     ) -> anyhow::Result<Transcript> {
         let mut state = self
             .ctx
@@ -174,6 +185,9 @@ impl WhisperEngine {
         // producing the sentence twice. See RunOpts::single_segment for the caveat
         // that matters on clips longer than whisper's 30-second window.
         params.set_single_segment(single_segment);
+        if let Some(ctx) = audio_ctx {
+            params.set_audio_ctx(ctx);
+        }
         if let Some(p) = prompt {
             params.set_initial_prompt(p);
         }

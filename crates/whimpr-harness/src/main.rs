@@ -117,6 +117,7 @@ struct Args {
     /// `--no-single-segment` turns off whisper's `single_segment` flag, so a >30s
     /// clip can emit more than one segment. This is the B2 truncation experiment.
     single_segment: bool,
+    audio_ctx: Option<i32>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -126,6 +127,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut repeat = 1usize;
     let mut quiet = false;
     let mut single_segment = true;
+    let mut audio_ctx: Option<i32> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -152,6 +154,13 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             "--quiet" => quiet = true,
             "--no-single-segment" => single_segment = false,
+            "--audio-ctx" => {
+                audio_ctx = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--audio-ctx needs a number"))?
+                        .parse()?,
+                )
+            }
             other if other.starts_with("--") => {
                 anyhow::bail!("unknown flag {other}")
             }
@@ -161,7 +170,7 @@ fn parse_args() -> anyhow::Result<Args> {
     if wavs.is_empty() {
         anyhow::bail!("usage: whimpr-harness <file.wav> [...] [--model P] [--prompt T] [--repeat N]");
     }
-    Ok(Args { wavs, model, prompt, repeat, quiet, single_segment })
+    Ok(Args { wavs, model, prompt, repeat, quiet, single_segment, audio_ctx })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -231,6 +240,7 @@ fn run_one(
     let opts = whimpr_asr::RunOpts {
         prompt: args.prompt.clone(),
         single_segment: args.single_segment,
+        audio_ctx: args.audio_ctx,
     };
     let t = Instant::now();
     let transcript = engine.transcribe_with_opts(&pcm, &opts)?;
