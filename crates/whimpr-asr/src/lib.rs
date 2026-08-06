@@ -178,8 +178,10 @@ impl WhisperEngine {
             params.set_initial_prompt(p);
         }
 
+        let padded = pad_tail(pcm16k);
+
         state
-            .full(params, pcm16k)
+            .full(params, &padded)
             .map_err(|e| anyhow::anyhow!("whisper full: {e}"))?;
 
         let n = state
@@ -193,9 +195,146 @@ impl WhisperEngine {
         }
 
         Ok(Transcript {
-            text: text.trim().to_string(),
+            text: strip_nonspeech_markers(&text),
             confidence: None,
         })
+    }
+}
+
+/// How much silence to append before handing audio to whisper.
+///
+/// Whisper drops the final word of a clip whose speech runs right up to the last
+/// sample. Push-to-talk hits that case on *every* dictation by construction — the
+/// key comes up right after the last word, so there is never a natural trailing
+/// pause. Measured on an 11.9 s fixture ending in "...for on-device transcription":
+///
+/// | trailing pad | final word |
+/// |---|---|
+/// | 0 ms   | lost |
+/// | 250 ms | lost |
+/// | 500 ms | present |
+/// | 1000 ms| present |
+///
+/// 500 ms is the first value that works; the constant sits at 750 ms for margin
+/// because the padding is *free*. Whisper pads every clip out to a 30-second
+/// window and runs the encoder over all of it, so ASR time is set by model size,
+/// not clip length — measured 1317/1227/1317/1261 ms across those four runs, i.e.
+/// noise. See project.md's latency section for the underlying measurement.
+///
+/// One edge case, accepted: a clip landing within 750 ms *below* a 30-second
+/// multiple gets pushed into an extra window, which costs one more encoder pass.
+/// That band is narrow and those dictations are already the slow ones.
+const TAIL_PAD_MS: usize = 750;
+const SAMPLE_RATE: usize = 16_000;
+
+fn pad_tail(pcm16k: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(pcm16k.len() + TAIL_PAD_MS * SAMPLE_RATE / 1000);
+    out.extend_from_slice(pcm16k);
+    out.resize(out.len() + TAIL_PAD_MS * SAMPLE_RATE / 1000, 0.0);
+    out
+}
+
+/// Substrings that mark a bracketed span as one of whisper's non-speech
+/// annotations rather than something the user actually said.
+const NONSPEECH_HINTS: &[&str] = &[
+    "blank_audio", "blankaudio", "blank audio", "silence", "no speech", "nospeech",
+    "inaudible", "music", "applause", "laughter", "background noise", "pause",
+];
+
+/// Remove whisper's non-speech annotations from a transcript.
+///
+/// On silence whisper does not stay quiet — it emits a literal `[BLANK_AUDIO]`
+/// token as ordinary segment text, and the app pastes it. That is almost certainly
+/// the "blank audio gets inserted when I don't say anything" complaint this project
+/// was scoped around: not a hallucinated sentence, just this marker.
+///
+/// Deliberately narrow. Only `[...]` / `(...)` spans whose contents match a known
+/// non-speech hint are removed, so a genuinely dictated parenthetical survives. A
+/// clip that was *only* a marker returns an empty string, and an empty transcript
+/// is already handled upstream as "nothing to paste".
+fn strip_nonspeech_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let close = match chars[i] {
+            '[' => Some(']'),
+            '(' => Some(')'),
+            _ => None,
+        };
+        match close.and_then(|c| chars[i..].iter().position(|&x| x == c).map(|p| i + p)) {
+            Some(end) => {
+                let inner: String = chars[i + 1..end].iter().collect::<String>().to_lowercase();
+                let squashed: String =
+                    inner.chars().filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '_').collect();
+                if NONSPEECH_HINTS.iter().any(|h| squashed.contains(h)) {
+                    i = end + 1;
+                    continue;
+                }
+                out.extend(&chars[i..=end]);
+                i = end + 1;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    // Collapse whitespace left behind by a removed marker.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_blank_audio_marker() {
+        assert_eq!(strip_nonspeech_markers("[BLANK_AUDIO]"), "");
+        assert_eq!(strip_nonspeech_markers("  [BLANK_AUDIO]  "), "");
+    }
+
+    #[test]
+    fn strips_marker_but_keeps_speech() {
+        assert_eq!(
+            strip_nonspeech_markers("Hello there. [BLANK_AUDIO] How are you?"),
+            "Hello there. How are you?"
+        );
+    }
+
+    #[test]
+    fn strips_common_nonspeech_annotations() {
+        for m in ["[ Silence ]", "(upbeat music)", "[INAUDIBLE]", "[Applause]", "[ pause ]"] {
+            assert_eq!(strip_nonspeech_markers(m), "", "failed to strip {m}");
+        }
+    }
+
+    #[test]
+    fn keeps_genuine_parentheticals() {
+        let s = "Send it to Max (the one from lacrosse) before noon.";
+        assert_eq!(strip_nonspeech_markers(s), s);
+        let s2 = "Use the array [0] index.";
+        assert_eq!(strip_nonspeech_markers(s2), s2);
+    }
+
+    #[test]
+    fn unmatched_bracket_is_left_alone() {
+        assert_eq!(strip_nonspeech_markers("a [ b c"), "a [ b c");
+    }
+
+    #[test]
+    fn pad_tail_appends_silence_and_preserves_input() {
+        let input = vec![0.5f32; 1600];
+        let out = pad_tail(&input);
+        assert_eq!(out.len(), 1600 + TAIL_PAD_MS * SAMPLE_RATE / 1000);
+        assert_eq!(&out[..1600], &input[..]);
+        assert!(out[1600..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn sanitize_prompt_removes_nulls_and_collapses_space() {
+        assert_eq!(sanitize_prompt("a\0b"), "ab");
+        assert_eq!(sanitize_prompt("  a \n\t b  "), "a b");
     }
 }
 
