@@ -96,17 +96,31 @@ debrand src-tauri/src/hotkey.rs \
   's/KEYCODE_HOTKEY:\s*i64\s*=\s*61/KEYCODE_HOTKEY: i64 = 63/g;
    s/FLAG_HOTKEY_MODIFIER:\s*u64\s*=\s*0x0008_0000/FLAG_HOTKEY_MODIFIER: u64 = 0x0080_0000/g;
    s/kVK_RightOption/kVK_Function/g;
-   s/kCGEventFlagMaskAlternate \(Option\)/kCGEventFlagMaskSecondaryFn/g;
-   s/Right Option/Fn/g'
+   s/kCGEventFlagMaskAlternate \(Option\)/kCGEventFlagMaskSecondaryFn/g'
 
-# Window title and the one user-facing mention in the UI.
-debrand src-tauri/src/hotkey.rs 's/\.title\("WhimprFlow Dev"\)/.title("WhimprFlow")/g'
+# Rename the key in user-facing text only -- inside string literals, never in
+# comments. A blanket substitution turned the comment above the constants into
+# "binds Fn instead of Fn", which is how you learn to scope these things.
+debrand src-tauri/src/hotkey.rs \
+  's/"((?:[^"\\]|\\.)*)"/ (my $t = $1) =~ s|Right Option|Fn|g; "\"$t\"" /gse'
+
+# Window title. This lives in lib.rs, not hotkey.rs -- getting that wrong is
+# exactly the kind of miss that ships an app titled "WhimprFlow Dev" over the
+# stable one, so it is applied to both files and asserted below.
+for f in src-tauri/src/lib.rs src-tauri/src/hotkey.rs; do
+  debrand "$f" 's/\.title\("WhimprFlow Dev"\)/.title("WhimprFlow")/g'
+done
 debrand ui/src/hub/Onboarding.tsx 's/WhimprFlow Dev/WhimprFlow/g; s/Right Option/Fn/g'
 
 # --- 3. Assert the de-brand actually worked, in the source -----------------
 
 say "Verifying no Dev branding survives"
-LEAKS=$(grep -rn "whimprflow\.dev\|WhimprFlow Dev" \
+# Functional occurrences only. Comments that mention the dev build are harmless
+# -- they do not reach the built app -- and trying to rewrite prose with sed is
+# how the "binds Fn instead of Fn" mangling happened. What must not survive is
+# anything that changes behaviour: the bundle/keychain identifier, a user-facing
+# "WhimprFlow Dev" string literal, or the app-support path.
+LEAKS=$(grep -rn 'whimprflow\.dev\|"WhimprFlow Dev"\|Application Support/WhimprFlow Dev' \
           src-tauri/src src-tauri/tauri.conf.json ui/src 2>/dev/null || true)
 if [ -n "$LEAKS" ]; then
   echo "$LEAKS"
@@ -114,6 +128,8 @@ if [ -n "$LEAKS" ]; then
 fi
 grep -q 'KEYCODE_HOTKEY: i64 = 63' src-tauri/src/hotkey.rs \
   || fail "hotkey keycode is not 63 (Fn) after de-branding"
+grep -q 'FLAG_HOTKEY_MODIFIER: u64 = 0x0080_0000' src-tauri/src/hotkey.rs \
+  || fail "hotkey modifier is not maskSecondaryFn after de-branding"
 grep -q '"signingIdentity"' src-tauri/tauri.conf.json \
   || fail "signingIdentity vanished -- it must be kept, not reverted"
 echo "    clean"
