@@ -1,0 +1,26 @@
+[package]
+name = "whimpr-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Offline pipeline harness: runs a .wav file through the real dictation pipeline
+# (resample -> ASR -> cleanup gate -> deterministic post-processing) and prints the
+# transcript plus per-stage timings.
+#
+# This exists because every previous session on this project was rate-limited by
+# needing a human to press a hotkey and speak. Anything that can be answered from a
+# recorded fixture -- ASR accuracy, the >30s truncation question, VAD behaviour on
+# silence, latency regressions -- can now be answered without one.
+#
+# Not part of the shipped app. The Tauri build only compiles src-tauri's binaries,
+# so adding this workspace member does not change what lands in the .app bundle.
+
+[dependencies]
+whimpr-core = { path = "../whimpr-core" }
+whimpr-audio = { path = "../whimpr-audio" }
+whimpr-asr = { path = "../whimpr-asr" }
+anyhow = { workspace = true }
+hound = "3"

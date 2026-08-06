@@ -4907,6 +4907,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "whimpr-harness"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "hound",
+ "whimpr-asr",
+ "whimpr-audio",
+ "whimpr-core",
+]
+
+[[package]]
 name = "whimpr-ipc"
 version = "0.1.1"
 dependencies = [
