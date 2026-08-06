@@ -281,7 +281,39 @@ fn strip_nonspeech_markers(text: &str) -> String {
         }
     }
     // Collapse whitespace left behind by a removed marker.
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Second rule, and the more robust of the two: if what survives is *entirely*
+    // one bracketed span, it is not speech. Whisper describes non-speech audio
+    // rather than staying quiet, and the vocabulary is open-ended — loud room tone
+    // produced "(water running)" here, and "(wind blowing)", "(typing)",
+    // "(door closes)" are all in the same family. Enumerating them is a losing
+    // game; noticing that the whole utterance is parenthetical is not.
+    //
+    // Nobody dictates a message consisting solely of a parenthetical, so the false
+    // positive is close to hypothetical, and pasting "(water running)" into
+    // whatever Max is writing is a much worse outcome than dropping it.
+    if is_wholly_bracketed(&out) {
+        return String::new();
+    }
+    out
+}
+
+/// Whether `s` is exactly one `[...]` or `(...)` span and nothing else.
+fn is_wholly_bracketed(s: &str) -> bool {
+    let s = s.trim();
+    let mut chars = s.chars();
+    let close = match chars.next() {
+        Some('[') => ']',
+        Some('(') => ')',
+        _ => return false,
+    };
+    // The closing bracket must be the final character, and must not appear earlier
+    // (otherwise "(a) and (b)" would qualify).
+    match s.char_indices().skip(1).find(|(_, c)| *c == close) {
+        Some((i, c)) => i + c.len_utf8() == s.len(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +347,34 @@ mod tests {
         assert_eq!(strip_nonspeech_markers(s), s);
         let s2 = "Use the array [0] index.";
         assert_eq!(strip_nonspeech_markers(s2), s2);
+    }
+
+    #[test]
+    fn drops_a_wholly_bracketed_transcript() {
+        // Whisper describes non-speech audio instead of staying quiet, with an
+        // open-ended vocabulary. Loud room tone produced exactly this one.
+        assert_eq!(strip_nonspeech_markers("(water running)"), "");
+        assert_eq!(strip_nonspeech_markers("  (wind blowing)  "), "");
+        assert_eq!(strip_nonspeech_markers("[door closes]"), "");
+    }
+
+    #[test]
+    fn wholly_bracketed_rule_does_not_eat_real_sentences() {
+        // A parenthetical that is only *part* of the utterance must survive, and so
+        // must a sentence containing more than one bracketed span.
+        let s = "(the one from lacrosse) will be there";
+        assert_eq!(strip_nonspeech_markers(s), s);
+        let s2 = "(a) and (b)";
+        assert_eq!(strip_nonspeech_markers(s2), s2);
+    }
+
+    #[test]
+    fn is_wholly_bracketed_edges() {
+        assert!(is_wholly_bracketed("(x)"));
+        assert!(!is_wholly_bracketed(""));
+        assert!(!is_wholly_bracketed("("));
+        assert!(!is_wholly_bracketed("(x) y"));
+        assert!(!is_wholly_bracketed("y (x)"));
     }
 
     #[test]
