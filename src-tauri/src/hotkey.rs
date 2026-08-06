@@ -33,7 +33,7 @@ mod imp {
     use tauri::{AppHandle, Emitter};
     use whimpr_core::state::{Action, BarState};
     use whimpr_core::{
-        AsrEngine, CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
+        CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
         TriggerToken,
     };
     use whimpr_ipc::BindingId;
@@ -542,8 +542,20 @@ mod imp {
                     let t_start = Instant::now();
                     let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
                     let ms_resample = t_start.elapsed().as_millis();
+                    // Bias decoding toward the user's own vocabulary. Unlike the
+                    // cleanup prompt this cannot be filtered to the utterance — there
+                    // is no transcript yet — so the whole dictionary goes in, trimmed
+                    // to whisper's 224-token budget inside the ASR crate. Costs no
+                    // measurable time and applies to every dictation, including the
+                    // majority that the cleanup gate skips.
+                    let asr_prompt = DICTIONARY
+                        .get()
+                        .and_then(|d| d.lock().unwrap().asr_prompt());
+                    if let Some(p) = asr_prompt.as_deref() {
+                        eprintln!("[whimpr] asr prompt: \"{p}\"");
+                    }
                     let t_asr = Instant::now();
-                    match asr.transcribe(&pcm) {
+                    match asr.transcribe_with_prompt(&pcm, asr_prompt.as_deref()) {
                         Ok(t) => {
                             let ms_asr = t_asr.elapsed().as_millis();
                             let raw = t.text;
