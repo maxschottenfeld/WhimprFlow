@@ -33,7 +33,7 @@ mod imp {
     use tauri::{AppHandle, Emitter};
     use whimpr_core::state::{Action, BarState};
     use whimpr_core::{
-        AsrEngine, CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
+        CleanupContext, CleanupMode, CleanupProvider, Input, PipelineEvent, StateMachine,
         TriggerToken,
     };
     use whimpr_ipc::BindingId;
@@ -62,6 +62,7 @@ mod imp {
             user_info: *mut c_void,
         ) -> CFMachPortRef;
         fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+        fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
         fn CGEventGetFlags(event: CGEventRef) -> u64;
         fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     }
@@ -536,8 +537,20 @@ mod imp {
                     let t_start = Instant::now();
                     let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
                     let ms_resample = t_start.elapsed().as_millis();
+                    // Bias decoding toward the user's own vocabulary. Unlike the
+                    // cleanup prompt this cannot be filtered to the utterance — there
+                    // is no transcript yet — so the whole dictionary goes in, trimmed
+                    // to whisper's 224-token budget inside the ASR crate. Costs no
+                    // measurable time and applies to every dictation, including the
+                    // majority that the cleanup gate skips.
+                    let asr_prompt = DICTIONARY
+                        .get()
+                        .and_then(|d| d.lock().unwrap().asr_prompt());
+                    if let Some(p) = asr_prompt.as_deref() {
+                        eprintln!("[whimpr] asr prompt: \"{p}\"");
+                    }
                     let t_asr = Instant::now();
-                    match asr.transcribe(&pcm) {
+                    match asr.transcribe_with_prompt(&pcm, asr_prompt.as_deref()) {
                         Ok(t) => {
                             let ms_asr = t_asr.elapsed().as_millis();
                             let raw = t.text;
@@ -601,9 +614,26 @@ mod imp {
         _info: *mut c_void,
     ) -> CGEventRef {
         if etype == K_CG_TAP_DISABLED_BY_TIMEOUT || etype == K_CG_TAP_DISABLED_BY_USER_INPUT {
+            // macOS disables a tap silently under load or around sleep/wake, and it
+            // stays dead until something re-enables it. Re-enabling here is not new
+            // — it dates to the original PoC — but it used to do so without a word,
+            // which is why nobody could tell from a log whether this path had ever
+            // fired. The "hotkey died after I closed the lid" reports have never been
+            // reproduced; if they recur, this line is the evidence to look for.
+            let why = if etype == K_CG_TAP_DISABLED_BY_TIMEOUT {
+                "timeout"
+            } else {
+                "user input"
+            };
             let port = TAP_PORT.load(Ordering::SeqCst);
             if !port.is_null() {
                 unsafe { CGEventTapEnable(port, true) };
+                eprintln!("[whimpr] event tap was disabled by macOS ({why}) — re-enabled");
+            } else {
+                eprintln!(
+                    "[whimpr] ⚠ event tap disabled by macOS ({why}) but the port is null — \
+                     the hotkey is now dead until relaunch"
+                );
             }
             return event;
         }
@@ -713,26 +743,66 @@ mod imp {
             while !crate::paste::is_trusted() {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            eprintln!("[whimpr] Accessibility present — creating global Fn tap");
-            let port = unsafe {
-                CGEventTapCreate(
-                    K_CG_SESSION_EVENT_TAP,
-                    K_CG_HEAD_INSERT,
-                    K_CG_TAP_OPTION_LISTEN_ONLY,
-                    EVENTS_OF_INTEREST,
-                    tap_callback,
-                    null_mut(),
-                )
-            };
-            if port.is_null() {
-                eprintln!(
-                    "[whimpr] Hotkey tap null despite Accessibility — likely a stale TCC entry \
-                     from an earlier build. Run: tccutil reset Accessibility \
-                     com.whimpr.whimprflow, then re-grant and relaunch."
-                );
-                return;
+            eprintln!("[whimpr] Accessibility present — creating global Right Option tap");
+
+            // Retry rather than give up. AXIsProcessTrusted() flipping true and the
+            // process actually being allowed to create a keyboard tap are not the
+            // same instant, so the first attempt after a fresh grant can return null
+            // on a race. This used to `return`, killing the hotkey until the app was
+            // relaunched — which matches the recurring "Right Option opens the
+            // overlay but nothing completes, and a clean relaunch fixes it" reports
+            // better than anything else in this file.
+            //
+            // Backoff to 2s and keep trying: a permanently-failing tap costs one log
+            // line every two seconds, and a hotkey that fixes itself thirty seconds
+            // later is far better than one that is dead until relaunch.
+            let mut port: CFMachPortRef = null_mut();
+            let mut attempt = 0u32;
+            while port.is_null() {
+                attempt += 1;
+                port = unsafe {
+                    CGEventTapCreate(
+                        K_CG_SESSION_EVENT_TAP,
+                        K_CG_HEAD_INSERT,
+                        K_CG_TAP_OPTION_LISTEN_ONLY,
+                        EVENTS_OF_INTEREST,
+                        tap_callback,
+                        null_mut(),
+                    )
+                };
+                if port.is_null() {
+                    if attempt == 1 || attempt % 15 == 0 {
+                        eprintln!(
+                            "[whimpr] ⚠ hotkey tap null despite Accessibility (attempt {attempt}) \
+                             — retrying. If this persists, a stale TCC entry from an earlier \
+                             build is the usual cause: run `tccutil reset Accessibility \
+                             com.whimpr.whimprflow.dev`, re-grant, and relaunch."
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(
+                        std::cmp::min(200 * attempt as u64, 2000),
+                    ));
+                }
+            }
+            if attempt > 1 {
+                eprintln!("[whimpr] hotkey tap created on attempt {attempt}");
             }
             TAP_PORT.store(port, Ordering::SeqCst);
+
+            // Watchdog. The callback above re-enables a tap that macOS disabled, but
+            // that only works if the disable is delivered as an event. This checks
+            // the tap's own state directly, so a tap that went dead without a
+            // callback — the shape the unreproduced sleep/wake reports would take —
+            // recovers within a few seconds instead of lasting until relaunch.
+            std::thread::spawn(|| loop {
+                std::thread::sleep(Duration::from_secs(3));
+                let port = TAP_PORT.load(Ordering::SeqCst);
+                if !port.is_null() && !unsafe { CGEventTapIsEnabled(port) } {
+                    eprintln!("[whimpr] ⚠ watchdog: event tap found disabled — re-enabling");
+                    unsafe { CGEventTapEnable(port, true) };
+                }
+            });
+
             unsafe {
                 let source = CFMachPortCreateRunLoopSource(null(), port, 0);
                 CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);

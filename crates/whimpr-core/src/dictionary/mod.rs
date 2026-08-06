@@ -84,6 +84,46 @@ impl DictionaryStore {
         self.entries.len() != before
     }
 
+    /// Build a whisper `initial_prompt` from the dictionary, or `None` when there is
+    /// nothing to bias toward.
+    ///
+    /// This is the dictionary's *second* consumer, and the important one. The first,
+    /// [`Self::prefilter`], feeds the cleanup LLM — but that only fires when
+    /// `needs_cleanup()` says the transcript looks messy, which is a minority of
+    /// dictations, so most of the time the dictionary did nothing at all. An
+    /// `initial_prompt` biases whisper's decoding directly and applies to *every*
+    /// dictation, fixing names at the acoustic level instead of repairing them after
+    /// the fact.
+    ///
+    /// Two deliberate differences from `prefilter`:
+    ///
+    /// - **It cannot filter by utterance.** The prompt has to be chosen before there
+    ///   is a transcript to compare against, so the whole dictionary goes in. That is
+    ///   fine: the budget is 224 tokens, which is a lot of proper nouns, and
+    ///   `WhisperEngine::fit_prompt` trims from the front if it overflows.
+    /// - **Only correct spellings are included, never mishears.** `prefilter` sends
+    ///   mishears to the cleanup LLM so it can recognise what to replace. Putting a
+    ///   mishear in an ASR prompt would bias decoding *toward* the wrong spelling —
+    ///   the exact opposite of the point.
+    ///
+    /// Entries stay in insertion order, so the newest (most likely to be currently
+    /// relevant) sit at the end — which is both what whisper weights most heavily and
+    /// what survives front-truncation.
+    pub fn asr_prompt(&self) -> Option<String> {
+        let terms: Vec<&str> = self
+            .entries
+            .iter()
+            .map(|e| e.correct.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if terms.is_empty() {
+            return None;
+        }
+        // "Glossary: a, b, c." — a plain term list, which measured better than the
+        // bare words alone on the proper-noun fixture (3 of 4 mis-spellings fixed).
+        Some(format!("Glossary: {}.", terms.join(", ")))
+    }
+
     /// Select the entries relevant to `utterance` — those whose spelling or a known
     /// mishear is edit-close to a spoken token (or adjacent token pair, to catch
     /// split words like "charge bee" → "ChargeBee") — capped to `max`.
@@ -163,6 +203,31 @@ mod tests {
     fn prefilter_ignores_unrelated_utterance() {
         let v = store().prefilter("the weather is nice today", 15);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn asr_prompt_lists_correct_spellings_only() {
+        let p = store().asr_prompt().unwrap();
+        assert!(p.contains("Manvi"), "{p}");
+        assert!(p.contains("ChargeBee"), "{p}");
+        // Mishears must never appear: they would bias decoding toward the error.
+        assert!(!p.contains("Monvi"), "{p}");
+        assert!(!p.contains("charge bee"), "{p}");
+    }
+
+    #[test]
+    fn asr_prompt_is_none_when_empty() {
+        assert!(DictionaryStore::default().asr_prompt().is_none());
+    }
+
+    #[test]
+    fn asr_prompt_preserves_insertion_order() {
+        // Newest last, so it survives front-truncation and gets whisper's heavier
+        // late-token weighting.
+        let mut s = store();
+        s.add("Zylophone", vec![], DictSource::Auto);
+        let p = s.asr_prompt().unwrap();
+        assert!(p.find("Manvi").unwrap() < p.find("Zylophone").unwrap(), "{p}");
     }
 
     #[test]

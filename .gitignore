@@ -25,3 +25,12 @@ src-tauri/gen/
 .env
 .env.*
 *.pem
+
+# Harness fixtures are generated (macOS `say` + afconvert) and are audio blobs;
+# scripts/make-fixtures.sh regenerates them byte-identically on any Mac.
+/fixtures/
+# Overnight-run scratch files.
+/OVERNIGHT-*.md
+
+# Staged by scripts/build-worker.sh for Tauri externalBin (a build artifact).
+/src-tauri/binaries/

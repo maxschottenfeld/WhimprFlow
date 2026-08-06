@@ -7,6 +7,7 @@ members = [
     "crates/whimpr-core",
     "crates/whimpr-audio",
     "crates/whimpr-asr",
+    "crates/whimpr-harness",
     "crates/whimpr-cleanup",
     "crates/whimpr-llm-worker",
     "crates/whimpr-sidecar",

@@ -71,6 +71,18 @@ fn app_support_dir() -> PathBuf {
 }
 
 /// Find the worker binary: next to the app executable (bundled), else the dev build dir.
+///
+/// The bundled copy is put there by Tauri's `externalBin` (see tauri.conf.json and
+/// scripts/build-worker.sh), which strips the target-triple suffix when it copies
+/// the binary into `Contents/MacOS/`. That is the path that should hit in a real
+/// install.
+///
+/// The dev fallback below is a *checkout-relative guess* and used to be the only
+/// thing that made cleanup work at all. It happens to be correct only because the
+/// repo lives at ~/WhimprFlow: move the .app anywhere else and cleanup would
+/// silently revert to pasting raw transcripts, with no error and no log line. It is
+/// kept for `cargo run` during development, but it now says so loudly, because
+/// "quietly worse output forever" is the worst way for this to fail.
 pub fn worker_bin_path() -> Option<PathBuf> {
     let exe_name = if cfg!(target_os = "windows") {
         "whimpr-llm-worker.exe"
@@ -83,22 +95,39 @@ pub fn worker_bin_path() -> Option<PathBuf> {
             if cand.exists() {
                 return Some(cand);
             }
+            eprintln!(
+                "[whimpr] no bundled cleanup worker at {} — falling back to the dev build dir",
+                cand.display()
+            );
         }
     }
     // Dev fallback.
     #[cfg(target_os = "windows")]
-    {
-        let dev = std::env::current_dir()
-            .unwrap_or_default()
-            .join("target/release")
-            .join(exe_name);
-        return dev.exists().then_some(dev);
-    }
+    let dev = std::env::current_dir()
+        .unwrap_or_default()
+        .join("target/release")
+        .join(exe_name);
     #[cfg(not(target_os = "windows"))]
-    {
+    let dev = {
         let home = std::env::var("HOME").unwrap_or_default();
-        let dev = PathBuf::from(home).join("WhimprFlow/target/release/whimpr-llm-worker");
-        dev.exists().then_some(dev)
+        PathBuf::from(home).join("WhimprFlow/target/release/whimpr-llm-worker")
+    };
+
+    if dev.exists() {
+        eprintln!(
+            "[whimpr] ⚠ using DEV worker path {} — this app bundle is not self-contained; \
+             cleanup will silently stop working if it is moved. Rebuild with \
+             `./ui/node_modules/.bin/tauri build` to bundle the worker.",
+            dev.display()
+        );
+        Some(dev)
+    } else {
+        eprintln!(
+            "[whimpr] ⚠ cleanup worker not found (looked next to the executable and at {}). \
+             Local cleanup is DISABLED — transcripts will be pasted raw.",
+            dev.display()
+        );
+        None
     }
 }
 
