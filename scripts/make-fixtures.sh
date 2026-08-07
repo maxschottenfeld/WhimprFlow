@@ -34,7 +34,7 @@ say48 short \
 # Proper nouns and jargon -- the baseline for measuring whether the dictionary,
 # fed in as whisper's initial_prompt, actually improves spelling.
 say48 propernouns \
-  "My name is Max Schottenfeld and I am studying at U C S B in the College of \
+  "My name is Alex Thornbury and I am studying at U C S B in the College of \
 Creative Studies. I work on WhimprFlow, a Rust and Tauri application that uses \
 Whisper and Silero for on device transcription."
 

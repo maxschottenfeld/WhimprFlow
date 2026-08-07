@@ -520,10 +520,19 @@ mod imp {
                         peak
                     );
                     if peak < 0.005 {
+                        // Do NOT say "grant access to your terminal" here. This app is
+                        // normally launched from Finder/Dock/launchd, where the terminal
+                        // is not in the picture at all, and that wording has already sent
+                        // Max toggling permissions for a problem that was never about
+                        // permissions (the real cause that time was the input device
+                        // flipping to a Bluetooth mic that delivers silence).
                         eprintln!(
-                            "[whimpr] ⚠ audio is silent — the mic isn't being captured. Grant \
-                             Microphone access to your terminal (System Settings → Privacy & \
-                             Security → Microphone), then fully quit + reopen it and rerun."
+                            "[whimpr] ⚠ audio is silent — nothing was captured. Either the \
+                             selected input device isn't delivering audio (check the device \
+                             name logged at capture start — a Bluetooth mic that just \
+                             connected will return silence for a few seconds), or WhimprFlow \
+                             itself lacks Microphone access (System Settings → Privacy & \
+                             Security → Microphone). Grant it to WhimprFlow, not to a terminal."
                         );
                     }
                     let Some(asr) = ASR.get().cloned() else {
@@ -535,7 +544,20 @@ mod imp {
                     // this is exactly the latency the user waits through before text
                     // appears — the number to optimize against.
                     let t_start = Instant::now();
-                    let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
+                    // Strip a long thinking-pause from the front before whisper sees
+                    // it. Past ~2s of leading silence whisper starts losing the speech
+                    // that follows outright -- see whimpr_audio::trim_leading_silence
+                    // for the measured table. Trimming here rather than after the
+                    // resample also means the anti-alias filter runs over less audio.
+                    let trimmed = whimpr_audio::trim_leading_silence(&res.samples, res.sample_rate);
+                    let cut = res.samples.len() - trimmed.len();
+                    if cut > 0 {
+                        eprintln!(
+                            "[whimpr] trimmed {:.2}s of leading silence",
+                            cut as f32 / res.sample_rate.max(1) as f32
+                        );
+                    }
+                    let pcm = whimpr_audio::resample_to_16k(trimmed, res.sample_rate);
                     let ms_resample = t_start.elapsed().as_millis();
                     // Bias decoding toward the user's own vocabulary. Unlike the
                     // cleanup prompt this cannot be filtered to the utterance — there

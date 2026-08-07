@@ -257,7 +257,10 @@ fn on_ptt_up() {
         let Some(asr) = ASR.get().cloned() else {
             return;
         };
-        let pcm = whimpr_audio::resample_to_16k(&res.samples, res.sample_rate);
+        // Same leading-silence trim the macOS path does -- the whisper failure it
+        // works around is in the decoder, not in anything platform-specific.
+        let trimmed = whimpr_audio::trim_leading_silence(&res.samples, res.sample_rate);
+        let pcm = whimpr_audio::resample_to_16k(trimmed, res.sample_rate);
         if let Ok(t) = asr.transcribe(&pcm) {
             let text = clean_transcript(&t.text);
             if !text.is_empty() {
