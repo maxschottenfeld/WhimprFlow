@@ -99,6 +99,22 @@ where
         let channels = supported.channels().max(1) as usize;
         let config = supported.config();
 
+        // Log which device we actually opened, at capture start.
+        //
+        // Without this the "hotkeys die after sleep/wake" reports could only ever be
+        // inferred from the sample rate: the built-in mic runs 48 kHz, an AirPods
+        // HFP link runs 24 kHz, and a capture that lands on a Bluetooth mic
+        // immediately after it connects returns digital silence. That inference was
+        // right but unprovable. The name makes it a fact, and it costs one line per
+        // dictation.
+        eprintln!(
+            "[whimpr-audio] input device: {:?} @ {} Hz, {} ch, {:?}",
+            device.name().unwrap_or_else(|_| "<unknown>".to_string()),
+            sample_rate,
+            channels,
+            sample_format
+        );
+
         let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
         let buf_cb = buffer.clone();
 
@@ -182,6 +198,103 @@ where
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!("capture thread exited before starting")),
     }
+}
+
+/// Frame size for the leading-silence scan. 20 ms is short enough to place a
+/// speech onset precisely and long enough for an RMS to mean something.
+const TRIM_FRAME_MS: usize = 20;
+
+/// How much lead-in to keep in front of the detected onset.
+///
+/// Not zero, deliberately. Whisper drops the *final* word of a clip that ends on
+/// a hard speech edge (see `whimpr-asr`'s `TAIL_PAD_MS`), and a hard edge at the
+/// *front* is the same class of hazard. 250 ms is comfortably inside the safe
+/// band measured below — 1 s of lead transcribes perfectly — while being far
+/// short of the 2 s where damage starts.
+const TRIM_KEEP_MS: usize = 250;
+
+/// Don't touch a clip whose leading silence is under this.
+///
+/// Measured: 0.4 s and 1.0 s of lead both transcribe perfectly, and damage only
+/// appears from 2 s. Leaving short leads completely alone means the overwhelming
+/// majority of dictations go through this function bit-identical, so the fix
+/// cannot regress the normal case.
+const TRIM_MIN_MS: usize = 1000;
+
+/// Strip a long run of silence from the FRONT of a capture.
+///
+/// **This fixes a real, reproduced correctness bug.** Whisper does not merely
+/// ignore leading silence — past about 2 seconds of it, it starts losing or
+/// inventing the speech that follows. Measured on `small.en` with synthetic
+/// fixtures (`scripts/make-pause-fixtures.sh`), one 6 s sentence behind a room-tone
+/// lead, transcript vs. the 18 words actually spoken:
+///
+/// | lead | result |
+/// |---|---|
+/// | 0.4 s | 18 words, correct |
+/// | 1 s   | 18 words, correct |
+/// | 2 s   | **15 words** — "Alpha checkpoint one, looking at" lost |
+/// | 3 s   | **15 words** — same loss |
+/// | 4 s   | "Alpha" degraded to "A" |
+/// | 5 s   | 19 words — a bare `"."` prepended |
+/// | 6 s   | 19 words — a bare `"."` prepended |
+/// | 8 s   | **10 words** — half the sentence lost, ASR 679 ms vs ~900 ms |
+/// | 10 s  | **hallucinated** "just like this." prepended |
+///
+/// Push-to-talk hits this constantly by construction: the key goes down, the user
+/// thinks about what to say, *then* speaks. It is the mechanism behind the
+/// 2026-08-07 front-truncation reports and behind the spurious leading periods
+/// reported independently — the same artefact seen from two directions. Trimming
+/// the lead restored all of the above to a full, correct 18 words.
+///
+/// Deliberately not a VAD. It finds one boundary at the front, never splits on
+/// interior silence, and never drops audio after the onset — a mid-utterance
+/// thinking-pause is measured-good (5 s mid-clip transcribes perfectly) and must
+/// survive untouched. A clip that is silent throughout is returned unchanged, so
+/// the existing empty-transcript path still handles it.
+pub fn trim_leading_silence(input: &[f32], sample_rate: u32) -> &[f32] {
+    if sample_rate == 0 || input.is_empty() {
+        return input;
+    }
+    let frame = sample_rate as usize * TRIM_FRAME_MS / 1000;
+    if frame == 0 || input.len() < frame * 2 {
+        return input;
+    }
+
+    let rms: Vec<f32> = input
+        .chunks_exact(frame)
+        .map(|f| (f.iter().map(|s| s * s).sum::<f32>() / frame as f32).sqrt())
+        .collect();
+    if rms.is_empty() {
+        return input;
+    }
+
+    // Noise floor from the 10th percentile rather than the minimum: a single
+    // freakishly quiet frame inside real room tone must not drag the floor down
+    // and make every later frame look like speech.
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = sorted[sorted.len() / 10];
+    let peak = sorted[sorted.len() - 1];
+
+    // Three-way gate. The relative terms adapt to a noisy room and to a quiet
+    // talker respectively; the absolute term (~ -58 dBFS) keeps digital-zero
+    // silence, where both relative terms collapse to zero, from matching the
+    // very first frame.
+    let threshold = (floor * 4.0).max(peak * 0.08).max(40.0 / 32_768.0);
+
+    let Some(first) = rms.iter().position(|&v| v > threshold) else {
+        // Nothing above the floor anywhere: the whole capture is silence. Leave it
+        // alone and let the empty-transcript path deal with it.
+        return input;
+    };
+
+    let keep = sample_rate as usize * TRIM_KEEP_MS / 1000;
+    let cut = (first * frame).saturating_sub(keep);
+    if cut < sample_rate as usize * TRIM_MIN_MS / 1000 {
+        return input;
+    }
+    &input[cut..]
 }
 
 /// Cutoff for the anti-alias filter, comfortably under the 8 kHz Nyquist of the
@@ -280,6 +393,93 @@ pub fn resample_to_16k(input: &[f32], src_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic pseudo-room-tone. `rand` is not a dependency of this crate and
+    /// is not worth adding for a test fixture.
+    fn noise(rate: u32, secs: f32, amp: f32) -> Vec<f32> {
+        let n = (rate as f32 * secs) as usize;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 8_388_608.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    /// A stand-in for speech: loud enough to clear the gate, unlike room tone.
+    fn loud(rate: u32, secs: f32) -> Vec<f32> {
+        tone(440.0, rate, secs).iter().map(|s| s * 0.5).collect()
+    }
+
+    #[test]
+    fn trims_a_long_room_tone_lead() {
+        let rate = 48_000;
+        let mut clip = noise(rate, 5.0, 0.005);
+        clip.extend(loud(rate, 3.0));
+        let out = trim_leading_silence(&clip, rate);
+        // 5 s of lead, 250 ms kept => ~4.75 s removed.
+        let removed = (clip.len() - out.len()) as f32 / rate as f32;
+        assert!(
+            (4.6..4.9).contains(&removed),
+            "expected ~4.75s removed, got {removed}"
+        );
+    }
+
+    #[test]
+    fn trims_digital_zero_lead_too() {
+        // Both relative terms of the gate collapse to zero here; the absolute
+        // floor is what has to carry it.
+        let rate = 48_000;
+        let mut clip = vec![0.0f32; rate as usize * 5];
+        clip.extend(loud(rate, 3.0));
+        let out = trim_leading_silence(&clip, rate);
+        assert!(out.len() < clip.len(), "digital-zero lead was not trimmed");
+    }
+
+    #[test]
+    fn leaves_a_short_lead_completely_alone() {
+        // The measured-safe band. The common case must be bit-identical, so that
+        // this fix cannot regress a normal dictation.
+        let rate = 48_000;
+        for lead in [0.0f32, 0.25, 0.4, 1.0] {
+            let mut clip = noise(rate, lead, 0.005);
+            clip.extend(loud(rate, 3.0));
+            let out = trim_leading_silence(&clip, rate);
+            assert_eq!(out.len(), clip.len(), "lead of {lead}s should not be trimmed");
+        }
+    }
+
+    #[test]
+    fn never_touches_a_mid_utterance_pause() {
+        // The thinking-pause case, which measured fine and must stay untouched --
+        // this is the difference between a leading trim and a VAD.
+        let rate = 48_000;
+        let mut clip = loud(rate, 2.0);
+        clip.extend(noise(rate, 6.0, 0.005));
+        clip.extend(loud(rate, 2.0));
+        let out = trim_leading_silence(&clip, rate);
+        assert_eq!(out.len(), clip.len(), "interior silence must survive");
+    }
+
+    #[test]
+    fn returns_an_all_silent_clip_unchanged() {
+        let rate = 48_000;
+        let clip = noise(rate, 6.0, 0.005);
+        assert_eq!(trim_leading_silence(&clip, rate).len(), clip.len());
+        let zeros = vec![0.0f32; rate as usize * 6];
+        assert_eq!(trim_leading_silence(&zeros, rate).len(), zeros.len());
+    }
+
+    #[test]
+    fn trim_edge_cases_do_not_panic() {
+        assert!(trim_leading_silence(&[], 48_000).is_empty());
+        assert_eq!(trim_leading_silence(&[0.1, 0.2], 48_000).len(), 2);
+        // A zero sample rate would make the frame size zero and divide by it.
+        assert_eq!(trim_leading_silence(&[0.1, 0.2], 0).len(), 2);
+    }
 
     #[test]
     fn resample_48k_to_16k_thirds_the_length() {

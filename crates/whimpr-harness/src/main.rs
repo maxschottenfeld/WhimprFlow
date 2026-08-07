@@ -25,6 +25,7 @@
 //!       [--prompt-file <path>]
 //!       [--repeat <n>]        # run each fixture n times (timing stability)
 //!       [--quiet]             # transcript + timing only, no banner
+//!       [--no-trim]           # skip the leading-silence trim (pre-fix behaviour)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -118,6 +119,9 @@ struct Args {
     /// clip can emit more than one segment. This is the B2 truncation experiment.
     single_segment: bool,
     audio_ctx: Option<i32>,
+    /// `--no-trim` skips the leading-silence trim, reproducing the pre-fix
+    /// behaviour. Keep this: it is how the truncation bug stays demonstrable.
+    trim: bool,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -128,6 +132,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut quiet = false;
     let mut single_segment = true;
     let mut audio_ctx: Option<i32> = None;
+    let mut trim = true;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -153,6 +158,7 @@ fn parse_args() -> anyhow::Result<Args> {
                     .parse()?
             }
             "--quiet" => quiet = true,
+            "--no-trim" => trim = false,
             "--no-single-segment" => single_segment = false,
             "--audio-ctx" => {
                 audio_ctx = Some(
@@ -170,7 +176,7 @@ fn parse_args() -> anyhow::Result<Args> {
     if wavs.is_empty() {
         anyhow::bail!("usage: whimpr-harness <file.wav> [...] [--model P] [--prompt T] [--repeat N]");
     }
-    Ok(Args { wavs, model, prompt, repeat, quiet, single_segment, audio_ctx })
+    Ok(Args { wavs, model, prompt, repeat, quiet, single_segment, audio_ctx, trim })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -234,8 +240,20 @@ fn run_one(
     println!("   input:    {secs:.2}s @ {rate} Hz, {} samples, peak {peak:.3} rms {rms:.4}", samples.len());
 
     let t = Instant::now();
-    let pcm = whimpr_audio::resample_to_16k(&samples, rate);
+    // Mirrors the app's order: trim the leading silence at the source rate, then
+    // resample. `--no-trim` restores the old behaviour, which is what makes the
+    // leading-silence bug demonstrable rather than merely fixed.
+    let trimmed: &[f32] = if args.trim {
+        whimpr_audio::trim_leading_silence(&samples, rate)
+    } else {
+        &samples
+    };
+    let cut_s = (samples.len() - trimmed.len()) as f32 / rate.max(1) as f32;
+    let pcm = whimpr_audio::resample_to_16k(trimmed, rate);
     let resample_ms = t.elapsed().as_millis();
+    if cut_s > 0.0 {
+        println!("   trim:     {cut_s:.2}s of leading silence removed");
+    }
 
     let opts = whimpr_asr::RunOpts {
         prompt: args.prompt.clone(),
