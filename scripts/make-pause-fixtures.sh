@@ -49,6 +49,13 @@ say_chunk charlie \
   "Charlie checkpoint three. And that is why the line at one half is the one \
 that actually matters for the critical strip."
 echo "  charlie"
+# One short sentence on its own, for the leading-silence sweep. Kept separate from
+# `alpha` so the sweep's clips stay well under whisper's 30-second window -- that is
+# what rules the window out as an explanation for what the sweep shows.
+say_chunk solo \
+  "Alpha checkpoint one. Looking at the zeta function, its magnitude only depends \
+on the real part of s."
+echo "  solo (18 words)"
 
 echo "spliced fixtures:"
 python3 - "$OUT" "$TMP" <<'PY'
@@ -80,7 +87,7 @@ def tone(sec, seed, amp=180):
 def zeros(sec):
     return [0] * int(RATE * sec)
 
-A, B, C = read('alpha'), read('bravo'), read('charlie')
+A, B, C, SOLO = read('alpha'), read('bravo'), read('charlie'), read('solo')
 # A short lead-in of room tone on every fixture: push-to-talk always captures a
 # little before the first word, and a clip that opens on a hard speech onset is
 # not what the app actually hands whisper.
@@ -116,7 +123,43 @@ for sec in (5, 8):
 # A long leading pause before any speech: the "I pressed the key then thought
 # about it" case, distinct from a mid-utterance pause.
 write('gap-lead-5s.wav', tone(5, 50) + A + B + C + TAIL())
+
+# ---------------------------------------------------------------------------
+# The leading-silence sweep -- THE fixtures that identified the bug.
+#
+# One 6-second sentence (18 words spoken) behind a lead of varying length. These
+# clips run 6.8-16.4s, far under whisper's 30-second window, which is exactly what
+# excludes the window, `single_segment` and clip length as explanations for what
+# they show. 1.25s and 1.5s bracket the trim's own 1s threshold, so a boundary bug
+# in the fix would show up here rather than hide between samples.
+for sec in (0.4, 1, 1.25, 1.5, 2, 3, 4, 5, 6, 8, 10):
+    name = f"{sec:g}".replace('.', '_')
+    write(f'lead-{name}s.wav', tone(sec, 100 + int(sec * 7)) + SOLO + TAIL())
+
+# Digital-zero rather than room tone. Both relative terms of the trim's energy gate
+# collapse to zero here, so this is what exercises its absolute floor.
+for sec in (3, 5, 8):
+    write(f'lead-{sec}s-digital.wav', zeros(sec) + SOLO + TAIL())
+
+# ---------------------------------------------------------------------------
+# Seam controls for the SEPARATE `single_segment` bug (project.md §8.4).
+#
+# An 8s silence spliced into the known-good 51s long45 fixture at three positions.
+# The 30s window seam falls INSIDE the silence only for at26. These exist to test
+# whether position matters -- measured 2026-08-07: it does not. All three lose
+# words with `single_segment` on, and at26 loses the fewest, which is what falsified
+# the original "silence straddling the seam" wording.
+import os
+if os.path.exists(f"{OUT}/long45.wav"):
+    r = wave.open(f"{OUT}/long45.wav", 'rb'); n = r.getnframes()
+    L = list(struct.unpack('<%dh' % n, r.readframes(n))); r.close()
+    for p in (8, 26, 42):
+        i = int(RATE * p)
+        write(f'seam-at{p}.wav', L[:i] + tone(8, p) + L[i:])
+else:
+    print("  (skipping seam-* : run scripts/make-fixtures.sh first for long45.wav)")
 PY
 
 echo
-echo "wrote $(ls -1 "$OUT"/gap-*.wav | wc -l | tr -d ' ') pause fixtures to $OUT/"
+echo "wrote $(ls -1 "$OUT"/gap-*.wav "$OUT"/lead-*.wav "$OUT"/seam-*.wav 2>/dev/null \
+  | wc -l | tr -d ' ') fixtures to $OUT/"

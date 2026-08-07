@@ -215,10 +215,27 @@ const TRIM_KEEP_MS: usize = 250;
 
 /// Don't touch a clip whose leading silence is under this.
 ///
-/// Measured: 0.4 s and 1.0 s of lead both transcribe perfectly, and damage only
-/// appears from 2 s. Leaving short leads completely alone means the overwhelming
-/// majority of dictations go through this function bit-identical, so the fix
-/// cannot regress the normal case.
+/// Combined with [`TRIM_KEEP_MS`] the trim engages once the speech onset is at
+/// least `TRIM_MIN_MS + TRIM_KEEP_MS` = **1.25 s** in.
+///
+/// Measured, on a 6 s sentence behind a room-tone lead: 0.4 s and 1 s transcribe
+/// perfectly; **1.25 s** is the first damage ("Alpha checkpoint" degrading to
+/// "A check point", no words lost); **1.5 s** is the first real loss. So the engage
+/// point lands exactly on the first observable damage and 250 ms below the first
+/// actual word loss.
+///
+/// **Do not lower this to buy more margin — it was tried and it backfired.**
+/// Dropping it to 700 ms (engage at ~1 s) made `speech-gap.wav` — 1 s of lead, a
+/// sentence, a 6 s interior gap, another sentence — lose its entire second
+/// sentence, 18 words down to 9, deterministically across three runs. Untrimmed it
+/// is correct. Whisper's behaviour around a clip that opens on a near-immediate
+/// speech onset *and* contains a long interior gap is genuinely erratic, and a
+/// shorter remaining lead walks into it.
+///
+/// That is the same non-monotonicity the sweep table shows, seen from the other
+/// side, and it is the real argument for this constant being conservative: leaving
+/// genuinely short leads bit-identical is not just about avoiding needless work,
+/// it is about not perturbing clips that already transcribe correctly.
 const TRIM_MIN_MS: usize = 1000;
 
 /// Strip a long run of silence from the FRONT of a capture.
@@ -231,15 +248,22 @@ const TRIM_MIN_MS: usize = 1000;
 ///
 /// | lead | result |
 /// |---|---|
-/// | 0.4 s | 18 words, correct |
-/// | 1 s   | 18 words, correct |
-/// | 2 s   | **15 words** — "Alpha checkpoint one, looking at" lost |
-/// | 3 s   | **15 words** — same loss |
-/// | 4 s   | "Alpha" degraded to "A" |
-/// | 5 s   | 19 words — a bare `"."` prepended |
-/// | 6 s   | 19 words — a bare `"."` prepended |
-/// | 8 s   | **10 words** — half the sentence lost, ASR 679 ms vs ~900 ms |
-/// | 10 s  | **hallucinated** "just like this." prepended |
+/// | 0.4 s  | 18 words, correct |
+/// | 1 s    | 18 words, correct |
+/// | 1.25 s | "Alpha checkpoint" degraded to "A check point" — damage starts here |
+/// | 1.5 s  | **15 words** — "Alpha checkpoint one" lost, "looking" → "Look" |
+/// | 2 s    | **15 words** — same loss |
+/// | 3 s    | **15 words** — same loss |
+/// | 4 s    | 18 words, but "Alpha" degraded to "A" |
+/// | 5 s    | 19 words — a bare `"."` prepended, no words lost |
+/// | 6 s    | 19 words — a bare `"."` prepended, no words lost |
+/// | 8 s    | **10 words** — half the sentence lost, ASR 679 ms vs ~900 ms |
+/// | 10 s   | **hallucinated** "just like this." prepended |
+///
+/// Note the curve is **not monotonic** — 4 s recovers to 18 words, 8 s collapses to
+/// 10, 10 s invents text. The trigger is established; what the decoder is doing
+/// internally is not, and this code does not claim to know. It removes the trigger
+/// rather than the mechanism, which is why it does not need to know.
 ///
 /// Push-to-talk hits this constantly by construction: the key goes down, the user
 /// thinks about what to say, *then* speaks. It is the mechanism behind the
@@ -444,12 +468,46 @@ mod tests {
         // The measured-safe band. The common case must be bit-identical, so that
         // this fix cannot regress a normal dictation.
         let rate = 48_000;
-        for lead in [0.0f32, 0.25, 0.4, 1.0] {
+        for lead in [0.0f32, 0.25, 0.4, 0.6] {
             let mut clip = noise(rate, lead, 0.005);
             clip.extend(loud(rate, 3.0));
             let out = trim_leading_silence(&clip, rate);
             assert_eq!(out.len(), clip.len(), "lead of {lead}s should not be trimmed");
         }
+    }
+
+    #[test]
+    fn engages_by_the_shortest_harmful_lead() {
+        // 1.25s is where damage was first measured and 1.5s is where words start
+        // being lost outright, so the trim has to be engaging through that band.
+        //
+        // Starts at 1.3 rather than 1.25 on purpose: the engage point IS a 1.25s
+        // onset, so an onset of exactly 1.25s falls inside the 20ms frame
+        // quantization and can land either side. The real lead-1_25s fixture does
+        // trim (its `say` onset sits a few ms later); a synthetic onset at exactly
+        // 1.25s does not. Asserting 1.25 here would be asserting a coin-flip.
+        let rate = 48_000;
+        for lead in [1.3f32, 1.5, 2.0] {
+            let mut clip = noise(rate, lead, 0.005);
+            clip.extend(loud(rate, 3.0));
+            let out = trim_leading_silence(&clip, rate);
+            assert!(
+                out.len() < clip.len(),
+                "lead of {lead}s must be trimmed -- it is at or above where whisper breaks"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_engage_on_a_one_second_lead() {
+        // Pinned deliberately, against a regression that was actually introduced and
+        // caught: lowering TRIM_MIN_MS so this case *did* trim cost speech-gap.wav
+        // its whole second sentence. A 1s lead transcribes correctly untouched, so
+        // touching it is pure downside.
+        let rate = 48_000;
+        let mut clip = noise(rate, 1.0, 0.005);
+        clip.extend(loud(rate, 3.0));
+        assert_eq!(trim_leading_silence(&clip, rate).len(), clip.len());
     }
 
     #[test]
