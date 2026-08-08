@@ -70,6 +70,19 @@ fn build_overlay(app: &tauri::App) -> tauri::Result<WebviewWindow> {
     .transparent(true)
     .shadow(false)
     .always_on_top(true)
+    // Join every Space (macOS "desktop"), not just the one the app launched on.
+    //
+    // `always_on_top` sets the window LEVEL; it does nothing about Space membership.
+    // Without this the pill belongs solely to whichever Space was frontmost at
+    // launch, so on any other Space there is no recording indicator at all -- and
+    // since the pill is the only feedback that a capture started, dictation becomes
+    // unusable there even though the global hotkey tap still fires.
+    //
+    // Reported 2026-08-07 right after a promotion, which is what surfaced it: the
+    // promote script relaunches both apps, re-creating the pill on whatever Space
+    // happened to be frontmost at that moment. Pre-existing, not new -- but it means
+    // every relaunch silently re-rolls which Space works.
+    .visible_on_all_workspaces(true)
     .skip_taskbar(true)
     .focused(false)
     .resizable(false)
