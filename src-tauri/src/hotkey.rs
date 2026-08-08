@@ -126,6 +126,31 @@ mod imp {
         text: String,
     }
 
+    /// One machine-parseable line per completed dictation (3b). Emitted via
+    /// `eprintln!` like everything else, prefixed `[whimpr-metrics]` so
+    /// `scripts/read-logs.py` can pull just these lines out of a day's log and
+    /// ignore the human-readable prose around them.
+    ///
+    /// `capture_start_ms` is `None` when the capture never delivered a sample
+    /// (see `whimpr_audio::CaptureStartTiming`) -- distinct from 0, which would
+    /// falsely imply an instant-open.
+    #[derive(Serialize)]
+    struct DictationMetrics {
+        ts: u64,
+        words: u32,
+        clip_pretrim_s: f32,
+        clip_posttrim_s: f32,
+        trim_engaged: bool,
+        trim_cut_s: f32,
+        capture_start_ms: Option<f64>,
+        resample_ms: u64,
+        asr_ms: u64,
+        cleanup_fired: bool,
+        cleanup_ms: u64,
+        paste_ms: u64,
+        total_ms: u64,
+    }
+
     /// The whisper ASR model to load: prefer the most accurate one present, in
     /// descending quality order, falling back to the small base model. Bigger
     /// English models mis-hear names/technical terms far less (and better ASR means
@@ -178,6 +203,181 @@ mod imp {
     }
     fn stats_path() -> PathBuf {
         support_dir().join("stats.json")
+    }
+    fn logs_dir() -> PathBuf {
+        support_dir().join("logs")
+    }
+
+    // ── Always-on file logging (3a) ─────────────────────────────────────────
+    //
+    // Finder/Dock/launchd launch WhimprFlow with fd 0/1/2 all on `/dev/null` --
+    // verified 2026-08-07 -- so all 64 `eprintln!` calls in this codebase vanish
+    // on every normal launch, including the one that would have settled the §6
+    // AirPods bug on 2026-08-06. This section `dup2`s a dated log file onto fd 2
+    // at startup so every existing `eprintln!` lands in a readable file, with
+    // ZERO call-site changes anywhere else. See project.md §6.
+    //
+    // Deliberately does nothing when stderr is NOT `/dev/null` (a terminal, an
+    // explicit `open --stderr` redirect) -- a dev session run by hand keeps
+    // printing to the terminal exactly as before.
+
+    /// True if `fd` and `/dev/null` are the same underlying file (device + inode).
+    /// Comparing identity rather than assuming fd 2 -> /dev/null lets this also
+    /// correctly no-op under an explicit `open --stderr /tmp/x.log` redirect,
+    /// which points fd 2 at a real file, not /dev/null.
+    fn fd_is_dev_null(fd: std::os::unix::io::RawFd) -> bool {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let mut target: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut target) != 0 {
+                return false;
+            }
+            let Ok(null_file) = std::fs::File::open("/dev/null") else {
+                return false;
+            };
+            let mut null_stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(null_file.as_raw_fd(), &mut null_stat) != 0 {
+                return false;
+            }
+            target.st_dev == null_stat.st_dev && target.st_ino == null_stat.st_ino
+        }
+    }
+
+    /// Today's date, in the *local* timezone (log files are named for the day
+    /// Max experiences, not UTC). `libc::localtime_r` rather than pulling in a
+    /// date/time crate -- this codebase stays dependency-light on purpose (see
+    /// stats.rs, settings.rs), and one POSIX call is all "what's today's local
+    /// date" needs.
+    fn local_date() -> (i32, u32, u32) {
+        unsafe {
+            let now = libc::time(null_mut());
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&now, &mut tm);
+            (tm.tm_year + 1900, (tm.tm_mon + 1) as u32, tm.tm_mday as u32)
+        }
+    }
+
+    fn local_date_string() -> String {
+        let (y, m, d) = local_date();
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    /// Days since the civil epoch (0000-03-01), Howard Hinnant's
+    /// `days_from_civil`. Used only to diff two calendar dates for the retention
+    /// prune below -- correct for the whole proleptic Gregorian calendar,
+    /// including leap years, with no date library.
+    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400; // [0, 399]
+        let mp = (m as i64 + 9) % 12; // [0, 11], Mar=0 .. Feb=11
+        let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Delete log files whose embedded date is more than `keep_days` before
+    /// today. ~42 KB/day at ~50 dictations (6 lines each) means this is about not
+    /// leaving an unbounded file on a machine with no maintainer for nine months,
+    /// not about disk pressure -- council finding, 2026-08-08.
+    fn prune_old_logs(dir: &std::path::Path, keep_days: i64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let (ty, tm, td) = local_date();
+        let today = days_from_civil(ty as i64, tm, td);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(date_part) = name
+                .strip_prefix("whimpr-")
+                .and_then(|s| s.strip_suffix(".log"))
+            else {
+                continue;
+            };
+            let parts: Vec<&str> = date_part.split('-').collect();
+            let (Some(y), Some(m), Some(d)) = (
+                parts.first().and_then(|s| s.parse::<i64>().ok()),
+                parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+                parts.get(2).and_then(|s| s.parse::<u32>().ok()),
+            ) else {
+                continue;
+            };
+            if today - days_from_civil(y, m, d) > keep_days {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Open today's log file and `dup2` it onto fd 2. Returns the date string the
+    /// file was opened for, so the rotation watchdog knows when it's stale.
+    fn open_and_redirect(dir: &std::path::Path) -> std::io::Result<String> {
+        use std::os::unix::io::AsRawFd;
+        std::fs::create_dir_all(dir)?;
+        let date = local_date_string();
+        let path = dir.join(format!("whimpr-{date}.log"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let rc = unsafe { libc::dup2(file.as_raw_fd(), 2) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // fd 2 now points at the same open file description as `file`'s fd.
+        // Leak `file` itself so its fd isn't closed out from under fd 2 when this
+        // function returns -- fd 2 stays valid for the process lifetime either
+        // way (dup2 gives it its own reference), but there's no reason to close
+        // and immediately lose the handle.
+        std::mem::forget(file);
+        Ok(date)
+    }
+
+    /// Poll for the local date changing and re-point fd 2 at the new day's file
+    /// when it does, pruning old files on every rotation. Polls rather than
+    /// sleeping-until-midnight to avoid timezone/offset arithmetic entirely --
+    /// log rotation has no reason to be precise to the second.
+    fn spawn_rotation_watchdog(dir: PathBuf, mut current: String) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(300));
+            let today = local_date_string();
+            if today != current {
+                match open_and_redirect(&dir) {
+                    Ok(d) => {
+                        current = d;
+                        prune_old_logs(&dir, 14);
+                        eprintln!("[whimpr] log rotated for {current}");
+                    }
+                    Err(e) => eprintln!("[whimpr] log rotation failed: {e}"),
+                }
+            }
+        });
+    }
+
+    /// Entry point: redirect fd 2 to a dated log file, if it isn't already
+    /// pointed somewhere real. Called once, as the very first thing `run()`
+    /// does, so every subsequent `eprintln!` -- including the ones from
+    /// `build_overlay` before `install()` even runs -- is captured.
+    ///
+    /// Never panics. A logging failure must not take down a dictation tool: on
+    /// any error this silently leaves fd 2 exactly as it was.
+    pub fn init_logging() {
+        if !fd_is_dev_null(2) {
+            return;
+        }
+        let dir = logs_dir();
+        prune_old_logs(&dir, 14);
+        match open_and_redirect(&dir) {
+            Ok(date) => {
+                eprintln!("[whimpr] logging to {}", dir.join(format!("whimpr-{date}.log")).display());
+                spawn_rotation_watchdog(dir, date);
+            }
+            Err(_) => {
+                // Nowhere to report this -- stderr is still /dev/null, and the
+                // log file we'd log the failure to is the thing that failed to
+                // open. Carry on silently, per the "never panic" rule.
+            }
+        }
     }
 
     /// Seconds since the Unix epoch (UTC), or 0 if the clock is before the epoch.
@@ -344,11 +544,18 @@ mod imp {
     /// Clean a raw transcript per the current settings (mode + level), feeding in the
     /// dictionary vocabulary relevant to this utterance. Falls back to raw whenever
     /// cleanup is off, the provider is unavailable, it errors, or the gates reject it.
-    fn clean_transcript(raw: &str) -> String {
+    ///
+    /// Returns `(text, fired)` where `fired` is whether an LLM call was actually
+    /// made -- distinct from "the gate wanted cleanup," which can be true while
+    /// `fired` is false (e.g. no provider configured). `fired` is the field the
+    /// per-dictation metrics line (3b) reports, because it's the one that costs
+    /// wall-clock time: the 2026-08-08 council found the cleanup LLM is the
+    /// dominant contributor to the p90 tail (~3.1s median when it runs).
+    fn clean_transcript(raw: &str) -> (String, bool) {
         let settings = current_settings();
         let level = settings.cleanup_level;
         if matches!(settings.cleanup_mode, CleanupMode::Raw) || level.bypasses_llm() {
-            return raw.to_string();
+            return (raw.to_string(), false);
         }
         // Turn explicit spoken layout cues ("new line", "new paragraph") into break
         // markers up front — the model passes an opaque marker through reliably but
@@ -366,7 +573,7 @@ mod imp {
         // of end-to-end latency. Deterministic post-processing still runs.
         if !whimpr_core::cleanup::needs_cleanup(raw) {
             eprintln!("[whimpr] cleanup skipped — transcript already clean");
-            return raw_out;
+            return (raw_out, false);
         }
         let vocab = DICTIONARY
             .get()
@@ -408,7 +615,11 @@ mod imp {
             CleanupMode::Local => run_local(),
             CleanupMode::Raw => None,
         };
-        match result {
+        // `Some(_)` means a provider was actually called (Ok or Err) -- that's the
+        // branch that spent wall-clock time. `None` means the gate wanted cleanup
+        // but nothing was available to run it, which costs nothing.
+        let fired = result.is_some();
+        let text = match result {
             Some(Ok(cleaned)) => {
                 // Deterministic safety net: convert any leftover spoken layout cue the
                 // model missed into real line breaks, strip stray code fences, cap blank
@@ -433,7 +644,8 @@ mod imp {
                 }
                 raw_out
             }
-        }
+        };
+        (text, fired)
     }
 
     fn now_ms() -> u64 {
@@ -487,10 +699,15 @@ mod imp {
             // Start the microphone; stream real RMS bars to the pill waveform.
             // Runs off the tap thread so the mic-permission prompt can't stall keys.
             Action::StartCapture { .. } => {
+                // Everything from here to whimpr_audio::start()'s device-open call
+                // is synchronous dispatch (tap callback -> state machine -> this
+                // arm), so this is effectively the key-down instant -- see
+                // whimpr_audio::CaptureStartTiming.
+                let key_down_at = Instant::now();
                 let app_thread = app.clone();
                 std::thread::spawn(move || {
                     let app_cb = app_thread.clone();
-                    match whimpr_audio::start(move |bars| {
+                    match whimpr_audio::start(key_down_at, move |bars| {
                         let _ = app_cb.emit_to(
                             OVERLAY_LABEL,
                             "whimpr://audio/waveform",
@@ -557,12 +774,11 @@ mod imp {
                     // resample also means the anti-alias filter runs over less audio.
                     let trimmed = whimpr_audio::trim_leading_silence(&res.samples, res.sample_rate);
                     let cut = res.samples.len() - trimmed.len();
+                    let trim_cut_s = cut as f32 / res.sample_rate.max(1) as f32;
                     if cut > 0 {
-                        eprintln!(
-                            "[whimpr] trimmed {:.2}s of leading silence",
-                            cut as f32 / res.sample_rate.max(1) as f32
-                        );
+                        eprintln!("[whimpr] trimmed {trim_cut_s:.2}s of leading silence");
                     }
+                    let clip_posttrim_s = trimmed.len() as f32 / res.sample_rate.max(1) as f32;
                     let pcm = whimpr_audio::resample_to_16k(trimmed, res.sample_rate);
                     let ms_resample = t_start.elapsed().as_millis();
                     // Bias decoding toward the user's own vocabulary. Unlike the
@@ -585,7 +801,7 @@ mod imp {
                             eprintln!("[whimpr] TRANSCRIPT: \"{}\"", raw);
                             // Clean the transcript (cloud LLM if configured), then paste.
                             let t_clean = Instant::now();
-                            let text = clean_transcript(&raw);
+                            let (text, cleanup_fired) = clean_transcript(&raw);
                             let ms_clean = t_clean.elapsed().as_millis();
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
@@ -595,6 +811,8 @@ mod imp {
                                 if let Err(e) = crate::paste::paste_text(&text) {
                                     eprintln!("[whimpr] paste failed: {e}");
                                 }
+                                let ms_paste = t_paste.elapsed().as_millis();
+                                let ms_total = t_start.elapsed().as_millis();
                                 eprintln!(
                                     "[whimpr] ⏱ audio {:.1}s | resample {}ms | asr {}ms | \
                                      cleanup {}ms | paste {}ms | TOTAL {}ms",
@@ -602,9 +820,31 @@ mod imp {
                                     ms_resample,
                                     ms_asr,
                                     ms_clean,
-                                    t_paste.elapsed().as_millis(),
-                                    t_start.elapsed().as_millis(),
+                                    ms_paste,
+                                    ms_total,
                                 );
+                                // One structured line per dictation (3b) -- everything
+                                // above in one greppable, machine-parseable record. See
+                                // scripts/read-logs.py.
+                                let metrics = DictationMetrics {
+                                    ts: unix_now(),
+                                    words: whimpr_core::stats::count_words(&text),
+                                    clip_pretrim_s: res.duration_secs(),
+                                    clip_posttrim_s,
+                                    trim_engaged: cut > 0,
+                                    trim_cut_s,
+                                    capture_start_ms: res.start_timing.first_sample_ms,
+                                    resample_ms: ms_resample as u64,
+                                    asr_ms: ms_asr as u64,
+                                    cleanup_fired,
+                                    cleanup_ms: ms_clean as u64,
+                                    paste_ms: ms_paste as u64,
+                                    total_ms: ms_total as u64,
+                                };
+                                match serde_json::to_string(&metrics) {
+                                    Ok(json) => eprintln!("[whimpr-metrics] {json}"),
+                                    Err(e) => eprintln!("[whimpr] metrics serialize failed: {e}"),
+                                }
                                 // Log words + speaking time for the Hub stats (WPM, streak…).
                                 record_dictation(&text, res.duration_secs());
                                 // Watch the field for a post-paste correction to learn (✨).
@@ -844,14 +1084,14 @@ mod imp {
 #[cfg(target_os = "macos")]
 pub use imp::{
     current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
-    history, install, rebuild_providers, stats_summary, update_settings,
+    history, init_logging, install, rebuild_providers, stats_summary, update_settings,
 };
 
 // Windows uses the real (but unverified) platform layer in `crate::win`.
 #[cfg(target_os = "windows")]
 pub use crate::win::{
     current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
-    history, install, rebuild_providers, stats_summary, update_settings,
+    history, init_logging, install, rebuild_providers, stats_summary, update_settings,
 };
 
 // Other platforms (Linux, etc.): inert stubs so the crate still builds.
@@ -875,9 +1115,10 @@ mod other {
     pub fn dictionary_add(_correct: String, _mishears: Vec<String>) {}
     pub fn dictionary_remove(_correct: &str) {}
     pub fn dictionary_learn(_correct: String, _mishears: Vec<String>) {}
+    pub fn init_logging() {}
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::{
     current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
-    history, install, rebuild_providers, stats_summary, update_settings,
+    history, init_logging, install, rebuild_providers, stats_summary, update_settings,
 };

@@ -188,7 +188,10 @@ fn request_microphone() {
     #[cfg(target_os = "macos")]
     {
         std::thread::spawn(|| {
-            if let Ok(h) = whimpr_audio::start(|_: &[f32]| {}) {
+            // No key-down to measure from here -- this is a manual permission
+            // priming call, not a dictation. `Instant::now()` just makes the
+            // timing mean "how long start() itself took."
+            if let Ok(h) = whimpr_audio::start(std::time::Instant::now(), |_: &[f32]| {}) {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 let _ = h.stop();
             }
@@ -242,6 +245,12 @@ fn set_api_key(provider: String, key: String) -> Result<(), String> {
 }
 
 pub fn run() {
+    // Always-on file logging (3a). Must run before anything else so every
+    // eprintln! from here on — including build_overlay's, below — lands in the
+    // log file instead of the /dev/null a Finder/Dock/launchd launch normally
+    // gives fd 2. See hotkey::init_logging for why this exists.
+    hotkey::init_logging();
+
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_settings,

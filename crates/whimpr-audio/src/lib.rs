@@ -10,6 +10,7 @@
 //! dedicated thread; control flows over channels.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -24,11 +25,34 @@ const EMIT_INTERVAL: Duration = Duration::from_millis(33);
 /// Perceptual gain applied to raw RMS so speech fills the meter without clipping.
 const LEVEL_GAIN: f32 = 14.0;
 
+/// Timestamps for bringing up the microphone, all measured as milliseconds
+/// elapsed from whatever instant the caller passes to [`start`] — normally
+/// key-down, so this is "how much of the utterance was said into a mic that
+/// wasn't listening yet."
+///
+/// **Measurement only.** This exists to answer the unmeasured question in
+/// `project.md` §7 (capture-start latency, Max's estimate ~0.5s, never timed).
+/// It does not itself change when or how the mic opens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptureStartTiming {
+    /// Cold-open sub-stages, cumulative from `key_down_at`.
+    pub device_ms: f64,
+    pub config_ms: f64,
+    pub built_ms: f64,
+    pub play_ms: f64,
+    /// When the first non-zero sample was actually delivered by CoreAudio.
+    /// `None` if the capture was stopped before any sample arrived (e.g. a
+    /// very short tap, or a device that never produced signal).
+    pub first_sample_ms: Option<f64>,
+}
+
 /// The captured audio for one utterance.
 pub struct CaptureResult {
     /// Mono samples at `sample_rate` (device-native; resample before ASR).
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    /// Cold-open timing for this capture. See [`CaptureStartTiming`].
+    pub start_timing: CaptureStartTiming,
 }
 
 impl CaptureResult {
@@ -67,17 +91,35 @@ impl Drop for CaptureHandle {
 
 /// Start capturing from the default input device.
 ///
+/// `key_down_at` is the instant capture-start latency should be measured from —
+/// normally the moment the push-to-talk key went down. Callers with no such
+/// moment (a manual permission-priming call, the harness) can pass
+/// `Instant::now()`; the timing this produces is then just "how long `start()`
+/// itself takes," which is still meaningful, just not the full user-perceived
+/// number.
+///
 /// `on_bars` is called ~30x/second with `WAVE_BARS` RMS levels in `[0, 1]`
 /// (oldest→newest), from the audio thread. Returns once the stream is playing (so
 /// a microphone-permission failure surfaces here, not silently).
-pub fn start<F>(on_bars: F) -> anyhow::Result<CaptureHandle>
+pub fn start<F>(key_down_at: Instant, on_bars: F) -> anyhow::Result<CaptureHandle>
 where
     F: Fn(&[f32]) + Send + 'static,
 {
     let (stop_tx, stop_rx) = channel::<()>();
     let (ready_tx, ready_rx) = channel::<anyhow::Result<()>>();
 
+    // Filled in as the cold-open proceeds; read back into the CaptureResult once
+    // the capture ends. See CaptureStartTiming's doc comment — this is
+    // measurement only, nothing here changes *when* the mic opens.
+    let timing = Arc::new(Mutex::new(CaptureStartTiming::default()));
+    let timing_setup = timing.clone();
+    let timing_cb = timing.clone();
+    let first_sample_seen = Arc::new(AtomicBool::new(false));
+    let first_sample_seen_cb = first_sample_seen.clone();
+
     let join = std::thread::spawn(move || -> Option<CaptureResult> {
+        let ms_since = move |t: Instant| t.duration_since(key_down_at).as_secs_f64() * 1000.0;
+
         let host = cpal::default_host();
         let device = match host.default_input_device() {
             Some(d) => d,
@@ -86,6 +128,7 @@ where
                 return None;
             }
         };
+        timing_setup.lock().unwrap().device_ms = ms_since(Instant::now());
         let supported = match device.default_input_config() {
             Ok(c) => c,
             Err(e) => {
@@ -93,6 +136,7 @@ where
                 return None;
             }
         };
+        timing_setup.lock().unwrap().config_ms = ms_since(Instant::now());
 
         let sample_format = supported.sample_format();
         let sample_rate = supported.sample_rate().0;
@@ -128,6 +172,23 @@ where
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
+                    // Capture-start instrumentation (3c): the first time this
+                    // callback delivers real signal, record how long the cold
+                    // open took from key-down. Guarded by the atomic so the
+                    // per-sample scan only runs during the (typically
+                    // sub-handful-of-callbacks) warm-up window, not for the
+                    // rest of the capture.
+                    if !first_sample_seen_cb.load(Ordering::Relaxed)
+                        && data.iter().any(|&s| s != 0.0)
+                    {
+                        first_sample_seen_cb.store(true, Ordering::Relaxed);
+                        let elapsed = ms_since(Instant::now());
+                        timing_cb.lock().unwrap().first_sample_ms = Some(elapsed);
+                        eprintln!(
+                            "[whimpr-audio] capture-start: first non-zero sample at {elapsed:.1}ms \
+                             from key-down"
+                        );
+                    }
                     let frames = data.len() / channels;
                     let mut sumsq = 0.0f32;
                     {
@@ -173,10 +234,12 @@ where
                 return None;
             }
         };
+        timing_setup.lock().unwrap().built_ms = ms_since(Instant::now());
         if let Err(e) = stream.play() {
             let _ = ready_tx.send(Err(anyhow::anyhow!("failed to start stream: {e}")));
             return None;
         }
+        timing_setup.lock().unwrap().play_ms = ms_since(Instant::now());
         let _ = ready_tx.send(Ok(()));
 
         // Keep the stream alive on this thread until asked to stop.
@@ -187,6 +250,7 @@ where
         Some(CaptureResult {
             samples,
             sample_rate,
+            start_timing: *timing.lock().unwrap(),
         })
     });
 
