@@ -4947,6 +4947,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "keyring",
+ "libc",
  "macos-accessibility-client",
  "objc2-app-kit",
  "objc2-av-foundation",

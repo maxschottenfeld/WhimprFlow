@@ -41,6 +41,11 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = "0.0.1"
+# Always-on file logging (hotkey.rs `init_logging`): dup2/fstat/localtime_r to
+# redirect fd 2 to a dated log file. Already resolved transitively (cpal pulls
+# it in), so this adds no new download -- just a direct dependency on a crate
+# that was already in the tree.
+libc = "0.2"
 # Frontmost-app detection (paste-target → per-app cleanup formatting). Already in
 # the tree via Tauri; declared here so we can call NSWorkspace directly.
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }

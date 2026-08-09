@@ -235,7 +235,8 @@ fn on_ptt_down() {
     }
     let _ = now_ms();
     emit_bar("recording");
-    std::thread::spawn(|| match whimpr_audio::start(|_: &[f32]| {}) {
+    let key_down_at = Instant::now();
+    std::thread::spawn(move || match whimpr_audio::start(key_down_at, |_: &[f32]| {}) {
         Ok(handle) => {
             *CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(handle);
         }
@@ -306,6 +307,15 @@ fn spawn_hook_thread() {
 }
 
 // ── Public surface (mirrors the macOS `hotkey::` functions the commands call) ────
+
+/// Always-on file logging (3a) is implemented for macOS only -- see
+/// `hotkey.rs`'s `imp::init_logging`. This Win32 platform layer is already
+/// flagged UNVERIFIED (written on macOS, never compiled or run on Windows);
+/// redirecting stderr on Windows needs `SetStdHandle`/console-API calls this
+/// project has no way to test, so it's left a no-op rather than shipped
+/// unverified. Windows dictations still print to whatever console is attached,
+/// same as before this change.
+pub fn init_logging() {}
 
 pub fn install(app: AppHandle) {
     let _ = APP.set(app);
