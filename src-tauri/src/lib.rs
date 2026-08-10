@@ -88,6 +88,20 @@ fn build_overlay(app: &tauri::App) -> tauri::Result<WebviewWindow> {
     .resizable(false)
     .visible(true)
     .build()?;
+    // Make the whole overlay window click-through. The window (300x72) is
+    // deliberately larger than the visible pill in every state but `recording`
+    // (see `dims` in FlowBar.tsx: idle 76x16, done/error/etc. 180x36), so its
+    // transparent margin was swallowing clicks meant for whatever app is
+    // underneath. CSS `pointer-events` can't fix this -- that only controls
+    // hit-testing *inside* the page, not whether the OS routes a click past
+    // this NSWindow to the window behind it; only the native cursor-events
+    // flag does that. Static, not toggled per-pixel, because nothing in the
+    // pill (CancelButton, StopButton) has a click handler today -- cancel is
+    // wired to Esc, not a click -- so there is no existing click behavior to
+    // preserve. If a click target is ever added to the pill, this will need
+    // to become a dynamic toggle (mousemove -> elementFromPoint -> flip this
+    // flag) instead of a blanket `true`.
+    overlay.set_ignore_cursor_events(true)?;
     position_overlay(&overlay);
     let _ = overlay.show();
     Ok(overlay)
