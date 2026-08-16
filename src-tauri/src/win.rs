@@ -263,7 +263,10 @@ fn on_ptt_up() {
         let trimmed = whimpr_audio::trim_leading_silence(&res.samples, res.sample_rate);
         let pcm = whimpr_audio::resample_to_16k(trimmed, res.sample_rate);
         if let Ok(t) = asr.transcribe(&pcm) {
-            let text = clean_transcript(&t.text);
+            // Same second application as the macOS path — cleanup's layout-cue
+            // rewrite can leave a period alone on its own line. Idempotent; the
+            // ASR crate already ran this on whisper's raw output.
+            let text = whimpr_asr::strip_pause_punctuation(&clean_transcript(&t.text));
             if !text.is_empty() {
                 if let Err(e) = paste_text(&text) {
                     eprintln!("[whimpr:win] paste failed: {e}");
