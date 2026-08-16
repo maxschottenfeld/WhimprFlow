@@ -109,7 +109,7 @@ fn build_overlay(app: &tauri::App) -> tauri::Result<WebviewWindow> {
 
 fn build_hub(app: &tauri::App) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::new(app, HUB_LABEL, WebviewUrl::App("index.html".into()))
-        .title("WhimprFlow Dev")
+        .title("WhimprFlow")
         .inner_size(920.0, 640.0)
         .min_inner_size(720.0, 480.0)
         .visible(true)
@@ -183,7 +183,7 @@ fn get_status() -> StatusReport {
 }
 
 fn has_key(account: &str) -> bool {
-    keyring::Entry::new("com.whimpr.whimprflow.dev", account)
+    keyring::Entry::new("com.whimpr.whimprflow", account)
         .ok()
         .and_then(|e| e.get_password().ok())
         .map(|k| !k.trim().is_empty())
@@ -246,7 +246,7 @@ fn set_api_key(provider: String, key: String) -> Result<(), String> {
         _ => return Err(format!("unknown provider {provider}")),
     };
     let entry =
-        keyring::Entry::new("com.whimpr.whimprflow.dev", account).map_err(|e| e.to_string())?;
+        keyring::Entry::new("com.whimpr.whimprflow", account).map_err(|e| e.to_string())?;
     let key = key.trim();
     // Delete any existing item first so the new one is created by (and readable to)
     // this app — a key added via the `security` CLI isn't readable by the app.

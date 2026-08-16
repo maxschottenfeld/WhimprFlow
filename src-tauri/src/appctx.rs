@@ -21,7 +21,7 @@ pub fn frontmost_bundle_id() -> Option<String> {
         app.bundleIdentifier()?
     };
     let bid = bid.to_string();
-    if bid == "com.whimpr.whimprflow.dev" {
+    if bid == "com.whimpr.whimprflow" {
         None
     } else {
         Some(bid)
