@@ -800,6 +800,22 @@ mod imp {
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
                             }
+                            // Second, idempotent application of the pause strip.
+                            // The ASR crate already ran it on whisper's own output,
+                            // which is where 15 of the 16 measured occurrences live.
+                            // The sixteenth is *created here*: whisper heard
+                            // "Wimperslow, Aeropod, Bug. New line.", and cleanup's
+                            // layout-cue rewrite turned "New line." into a newline
+                            // and left the period behind on a line of its own
+                            // (whimpr-2026-08-12.log:567). Cleanup has never added an
+                            // ellipsis in 206 dictations, so this costs nothing on the
+                            // normal path — but it is the only thing standing between
+                            // that stray period and Max's document.
+                            let pre_strip = text;
+                            let text = whimpr_asr::strip_pause_punctuation(&pre_strip);
+                            if text != pre_strip {
+                                eprintln!("[whimpr] PAUSE-STRIP: \"{}\"", text);
+                            }
                             if !text.is_empty() {
                                 let t_paste = Instant::now();
                                 if let Err(e) = crate::paste::paste_text(&text) {

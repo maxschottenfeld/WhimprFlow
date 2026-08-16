@@ -208,8 +208,13 @@ impl WhisperEngine {
             }
         }
 
+        // Two independent cleanups of whisper's own output, in order: its
+        // bracketed non-speech annotations, then the punctuation it emits when it
+        // is decoding a thinking-pause rather than speech. Both are text-domain
+        // and both can return empty, which the paste path already treats as
+        // "nothing to paste".
         Ok(Transcript {
-            text: strip_nonspeech_markers(&text),
+            text: strip_pause_punctuation(&strip_nonspeech_markers(&text)),
             confidence: None,
         })
     }
@@ -330,6 +335,175 @@ fn is_wholly_bracketed(s: &str) -> bool {
     }
 }
 
+/// Sentence punctuation that whisper emits *instead of* words when it is
+/// decoding silence. Deliberately not "all punctuation" — a line of `---` or a
+/// stray `}` from dictated code is content, and must survive.
+const PAUSE_PUNCT: &[char] = &['.', ',', '!', '?', ';', ':', '…'];
+
+fn is_pause_punct(c: char) -> bool {
+    PAUSE_PUNCT.contains(&c)
+}
+
+/// Closing delimiters, which never want a space in front of them either. Whisper
+/// puts a trail-off inside the quote — `I could be done..."` — and the
+/// replacement space would otherwise strand the quote: `done " That`.
+const CLOSING: &[char] = &['"', '\'', ')', ']', '}', '”', '’'];
+
+fn is_closing(c: char) -> bool {
+    CLOSING.contains(&c)
+}
+
+/// Whether `s` carries nothing but sentence punctuation and whitespace.
+fn is_wholly_pause_punct(s: &str) -> bool {
+    !s.trim().is_empty() && s.chars().all(|c| c.is_whitespace() || is_pause_punct(c))
+}
+
+/// Drop punctuation sitting in front of the first word of a line.
+///
+/// Nobody dictates a line that opens `". Alpha checkpoint"`. Whisper produces
+/// exactly that when a clip opens on silence — reproducible today with
+/// `cargo run --release -p whimpr-harness -- --no-trim fixtures/lead-5s.wav`,
+/// which returns `". Alpha checkpoint 1, looking at the zeta function…"`. This is
+/// the literal shape of G1: a period added because of a pause.
+///
+/// In production `trim_leading_silence` (§6b) usually removes the lead before
+/// whisper sees it — which is why the 206-dictation corpus contains no leading
+/// period at all — but that trim deliberately ignores any lead under one second,
+/// so the case is defended rather than assumed away.
+///
+/// **The trailing space is the whole guard.** `". Alpha"` opens with a period
+/// that is followed by a space and is stripped; `".md files are fine"` opens with
+/// a period that is *not*, and is left exactly alone.
+fn strip_leading_orphan(line: &str) -> String {
+    let mut s = line;
+    loop {
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (Some(c), Some(next)) if is_pause_punct(c) && next.is_whitespace() => {
+                s = s[c.len_utf8()..].trim_start();
+            }
+            _ => return s.to_string(),
+        }
+    }
+}
+
+/// Remove punctuation that whisper inserted because Max *paused*, not because he
+/// said anything.
+///
+/// Whisper renders a thinking-pause as an ellipsis, because that is what an
+/// ellipsis means in the text it was trained on. Measured over 206 real logged
+/// dictations (2026-08-09 → 08-15, `Reports/2026-08-16-overnight-summary.md`):
+/// `...` appears in **15 of 206 (7.3%)**, 18 occurrences, and it is always in
+/// whisper's raw output — the cleanup LLM added one **zero** times. Those
+/// dictations are the sparse ones: 0.55 s/word median against 0.38 for the rest,
+/// worst case `"Plus... work."` at 7.4 seconds of audio for two words.
+///
+/// This is a **text-domain** strip and cannot cause the audio-domain failures
+/// this project has hit before (§6b's leading-silence trim). It removes three
+/// dots after transcription; it never touches the samples.
+///
+/// The rule, in order:
+///
+/// 1. Every ellipsis form → a single space. Replacing rather than deleting is
+///    load-bearing: `"That is...entertainment"` must not become
+///    `"That isentertainment"`. The space is skipped when the next character is
+///    punctuation the speaker dictated, or a closing delimiter, so
+///    `"Plus..., work"` lands on `"Plus, work"` rather than `"Plus , work"`, and
+///    `I could be done..."` keeps its quote attached.
+/// 2. Collapse runs of spaces, per line. Newlines survive, because this also
+///    runs after cleanup, which is what turns a dictated "new line" into one.
+/// 3. Drop any line that is nothing but sentence punctuation. A *blank* line is
+///    kept — a dictated paragraph break is content. Then drop punctuation
+///    stranded in front of a line's first word — see [`strip_leading_orphan`].
+/// 4. If nothing but sentence punctuation survives, return empty. Same reasoning
+///    as [`is_wholly_bracketed`] — a 23.5-second clip in the corpus transcribed
+///    to the single character `","` and pasted it. Nobody dictates a message
+///    that is one comma.
+/// 5. Trim the ends. `"How..."` becomes `"How"`, **adding nothing** — inventing a
+///    period where a trail-off was is inventing content Max did not say. That is
+///    his explicit call, 2026-08-16.
+///
+/// Not stripped, on purpose: a lone period that ends a real sentence. `"Katie."`,
+/// `"Run."` and `"Thank you."` are dictations in the corpus and their periods are
+/// correct. Only punctuation with *no words attached to it* is removable.
+pub fn strip_pause_punctuation(text: &str) -> String {
+    // 1. Every ellipsis form → one space. `…` is U+2026; the ASCII run is 3-or-more
+    //    so a 4-dot `....` cannot slip past (it has never appeared in the corpus,
+    //    but the cost of covering it is one character of pattern). The spaced
+    //    `. . .` form is handled by scanning across whitespace between dots.
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '…' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        if chars[i] == '.' {
+            // Count dots, allowing spaces/tabs (not newlines) between them, so
+            // both `...` and `. . .` are recognised as one token.
+            let mut j = i;
+            let mut dots = 0;
+            let mut last_dot = i;
+            while j < chars.len() {
+                if chars[j] == '.' {
+                    dots += 1;
+                    last_dot = j;
+                    j += 1;
+                } else if chars[j] == ' ' || chars[j] == '\t' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if dots >= 3 {
+                // The replacement is a space *unless* the next thing along is
+                // punctuation the speaker did dictate — `"Plus..., work"` has to
+                // land on `"Plus, work"`, not `"Plus , work"`.
+                //
+                // Deciding this here, rather than closing up spaces in a later
+                // pass, is what keeps the rule off text it did not create: a
+                // global "no space before a dot" rule turns the real dictation
+                // `"editing CLAUDE.md and .md files"` into `"and.md files"`.
+                let next = chars[last_dot + 1..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .copied();
+                if !next.is_some_and(|c| is_pause_punct(c) || is_closing(c)) {
+                    out.push(' ');
+                }
+                i = last_dot + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    // 2 + 3. Per line: collapse runs of spaces, then drop the line entirely if no
+    //    words are left on it. A *blank* line is kept — dictated paragraph breaks
+    //    are content, and only a line carrying punctuation and nothing else is
+    //    evidence of a pause.
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.split('\n') {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if is_wholly_pause_punct(&collapsed) {
+            continue;
+        }
+        lines.push(strip_leading_orphan(&collapsed));
+    }
+    let joined = lines.join("\n");
+
+    // 5. Nothing but punctuation survived — there was no speech here.
+    if is_wholly_pause_punct(&joined) {
+        return String::new();
+    }
+    // 6. Trim. Whitespace-only can only reach here from an all-whitespace input,
+    //    and the paste path treats empty as "nothing to paste".
+    joined.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +583,225 @@ mod tests {
     fn sanitize_prompt_removes_nulls_and_collapses_space() {
         assert_eq!(sanitize_prompt("a\0b"), "ab");
         assert_eq!(sanitize_prompt("  a \n\t b  "), "a b");
+    }
+
+    // ---------------------------------------------------------------- G1: the
+    // pause-punctuation strip. Every row of the table Max signed off on
+    // 2026-08-16, then the traps, then the shapes that must NOT change.
+
+    /// The five real shapes, verbatim from the agreed rule table.
+    #[test]
+    fn pause_strip_agreed_rule_table() {
+        assert_eq!(
+            strip_pause_punctuation("That is...entertainment"),
+            "That is entertainment"
+        );
+        assert_eq!(strip_pause_punctuation("Plus... work."), "Plus work.");
+        assert_eq!(strip_pause_punctuation("How..."), "How");
+        assert_eq!(
+            strip_pause_punctuation("...where did you put"),
+            "where did you put"
+        );
+        assert_eq!(
+            strip_pause_punctuation("put...where did you put"),
+            "put where did you put"
+        );
+    }
+
+    /// Trailing adds nothing. `"How..."` is `"How"`, never `"How."` — inventing a
+    /// period is inventing content. Max's explicit call, 2026-08-16.
+    #[test]
+    fn pause_strip_trailing_adds_no_period() {
+        assert_eq!(strip_pause_punctuation("How..."), "How");
+        assert_eq!(strip_pause_punctuation("Can you..."), "Can you");
+        assert_eq!(strip_pause_punctuation("Onward earbuds is..."), "Onward earbuds is");
+        assert!(!strip_pause_punctuation("How...").ends_with('.'));
+    }
+
+    /// Trap 1: naive deletion joins words. This is the one that silently corrupts.
+    #[test]
+    fn pause_strip_never_joins_words() {
+        for s in [
+            "That is...entertainment",
+            "put...where did you put",
+            "Does indexing...can you define the series",
+            "Yeah, where can you put...where did you put that statement?",
+        ] {
+            assert!(
+                !strip_pause_punctuation(s).contains("isentertainment"),
+                "joined words in {s:?}"
+            );
+            assert!(
+                !strip_pause_punctuation(s).contains("putwhere"),
+                "joined words in {s:?}"
+            );
+            assert!(
+                !strip_pause_punctuation(s).contains("indexingcan"),
+                "joined words in {s:?}"
+            );
+        }
+    }
+
+    /// Trap 3: the inserted space must close up against following punctuation.
+    #[test]
+    fn pause_strip_closes_space_before_punctuation() {
+        assert_eq!(strip_pause_punctuation("Plus..., work"), "Plus, work");
+        assert_eq!(strip_pause_punctuation("so..., then"), "so, then");
+        assert_eq!(strip_pause_punctuation("really...? yes"), "really? yes");
+        assert_eq!(strip_pause_punctuation("so...; next"), "so; next");
+        // A trail-off inside a quotation — real, whimpr-2026-08-11.log:694.
+        assert_eq!(
+            strip_pause_punctuation("like, \"I could be done...\" That lesson"),
+            "like, \"I could be done\" That lesson"
+        );
+        assert_eq!(strip_pause_punctuation("(so on...) next"), "(so on) next");
+        // Four dots spread across spaces is one long trail-off, not an ellipsis
+        // plus a sentence period — there is no way to tell them apart and no
+        // instance of either in the corpus.
+        assert_eq!(strip_pause_punctuation("wait... . done"), "wait done");
+    }
+
+    /// The rule must never close up a space it did not create. This exact string
+    /// is a real dictation (whimpr-2026-08-12.log:481) and an early draft turned
+    /// it into `"and.md files"`.
+    #[test]
+    fn pause_strip_leaves_untouched_spaces_alone() {
+        let s = "Go ahead and action all of those just for editing CLAUDE.md and .md files.";
+        assert_eq!(strip_pause_punctuation(s), s);
+        assert_eq!(strip_pause_punctuation("the . thing"), "the . thing");
+    }
+
+    /// Trap 2: an ellipsis-only clip strips to empty, not to a stray space.
+    #[test]
+    fn pause_strip_punctuation_only_becomes_empty() {
+        assert_eq!(strip_pause_punctuation("..."), "");
+        assert_eq!(strip_pause_punctuation("  ...  "), "");
+        assert_eq!(strip_pause_punctuation("…"), "");
+        // The real one: a 23.5-second clip in the corpus transcribed to `","`.
+        assert_eq!(strip_pause_punctuation(","), "");
+        assert_eq!(strip_pause_punctuation("."), "");
+        assert_eq!(strip_pause_punctuation(" . , "), "");
+        assert_eq!(strip_pause_punctuation(""), "");
+    }
+
+    /// All three written forms of the token are the same token.
+    #[test]
+    fn pause_strip_covers_every_ellipsis_form() {
+        assert_eq!(strip_pause_punctuation("a...b"), "a b");
+        assert_eq!(strip_pause_punctuation("a…b"), "a b");
+        assert_eq!(strip_pause_punctuation("a. . .b"), "a b");
+        assert_eq!(strip_pause_punctuation("a....b"), "a b");
+        assert_eq!(strip_pause_punctuation("a.....b"), "a b");
+    }
+
+    /// The cleanup-created artifact: a dictated "new line" leaves a period alone
+    /// on its own line. Whisper said `"Wimperslow, Aeropod, Bug. New line."`
+    /// (whimpr-2026-08-12.log:567) and cleanup pasted `"…Bug.\n."`.
+    #[test]
+    fn pause_strip_drops_punctuation_only_lines() {
+        assert_eq!(
+            strip_pause_punctuation("Wimprflow, Airpod, Bug.\n."),
+            "Wimprflow, Airpod, Bug."
+        );
+        assert_eq!(strip_pause_punctuation("one\n.\ntwo"), "one\ntwo");
+        // A blank line is a dictated paragraph break, not a pause. It stays.
+        assert_eq!(strip_pause_punctuation("one\n\ntwo"), "one\n\ntwo");
+    }
+
+    /// A lone period that ends a real sentence is CORRECT and must survive. These
+    /// are all real dictations from the corpus. Over-stripping here would be a
+    /// worse bug than the one being fixed.
+    #[test]
+    fn pause_strip_keeps_real_sentence_periods() {
+        for s in [
+            "Katie.",
+            "Run.",
+            "Thank you.",
+            "That makes sense.",
+            "To clarify.",
+            "S equals 1/2.",
+            "Obsidian looks good.",
+            "Oh, it's the Fibonacci.",
+            "Hello, hello, hello.",
+            "Run my morning brief.",
+            "Well, my daily briefing and then let's run review/plan.",
+        ] {
+            assert_eq!(strip_pause_punctuation(s), s, "changed a clean dictation");
+        }
+    }
+
+    /// Decimals, abbreviations, file extensions and ratios keep their dots.
+    #[test]
+    fn pause_strip_keeps_ordinary_dots() {
+        for s in [
+            "It costs 3.50 today.",
+            "Edit the .md files, i.e. the notes.",
+            "Version 1.2.3 shipped.",
+            "See U.S. policy.",
+            "Go ahead and action all of those just for editing CLAUDE.md and .md files.",
+        ] {
+            assert_eq!(strip_pause_punctuation(s), s, "mangled ordinary dots");
+        }
+    }
+
+    /// Content that merely *looks* like punctuation must survive: a markdown rule
+    /// and a dictated closing brace are not pauses.
+    #[test]
+    fn pause_strip_keeps_non_sentence_punctuation_lines() {
+        assert_eq!(strip_pause_punctuation("one\n---\ntwo"), "one\n---\ntwo");
+        assert_eq!(strip_pause_punctuation("fn main() {\n}\n"), "fn main() {\n}");
+    }
+
+    /// A period stranded in front of the first word is G1's literal shape.
+    /// The BEFORE string is real harness output:
+    /// `whimpr-harness -- --no-trim fixtures/lead-5s.wav`.
+    #[test]
+    fn pause_strip_drops_leading_orphan_punctuation() {
+        assert_eq!(
+            strip_pause_punctuation(
+                ". Alpha checkpoint 1, looking at the zeta function, its magnitude \
+                 only depends on the real part of S."
+            ),
+            "Alpha checkpoint 1, looking at the zeta function, its magnitude only \
+             depends on the real part of S."
+        );
+        assert_eq!(strip_pause_punctuation(", hello there"), "hello there");
+        assert_eq!(strip_pause_punctuation(". . hello"), "hello");
+        assert_eq!(strip_pause_punctuation("one\n. two"), "one\ntwo");
+    }
+
+    /// ...but the space after it is the guard, and a file extension has none.
+    #[test]
+    fn pause_strip_keeps_leading_dot_that_starts_a_word() {
+        assert_eq!(strip_pause_punctuation(".md files are fine"), ".md files are fine");
+        assert_eq!(strip_pause_punctuation(".gitignore needs a line"), ".gitignore needs a line");
+        assert_eq!(strip_pause_punctuation("...md files"), "md files");
+    }
+
+    /// Running it twice changes nothing — it also runs after cleanup.
+    #[test]
+    fn pause_strip_is_idempotent() {
+        for s in [
+            "That is...entertainment",
+            "Plus... work.",
+            "How...",
+            "Wimprflow, Airpod, Bug.\n.",
+            "Katie.",
+            ",",
+        ] {
+            let once = strip_pause_punctuation(s);
+            assert_eq!(strip_pause_punctuation(&once), once, "not idempotent on {s:?}");
+        }
+    }
+
+    /// The whole ASR exit path: markers first, then pause punctuation.
+    #[test]
+    fn asr_exit_strips_markers_then_pause_punctuation() {
+        let run = |s: &str| strip_pause_punctuation(&strip_nonspeech_markers(s));
+        assert_eq!(run("[BLANK_AUDIO]"), "");
+        assert_eq!(run("Plus... work."), "Plus work.");
+        assert_eq!(run("Hello there. [BLANK_AUDIO] How..."), "Hello there. How");
+        assert_eq!(run("(water running)"), "");
     }
 }
 
