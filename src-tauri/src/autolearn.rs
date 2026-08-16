@@ -148,6 +148,17 @@ mod imp {
         let inserted = inserted.to_string();
         let focused = unsafe { copy_focused_element() };
         if focused.is_null() {
+            // Observability only. This path used to return in total silence, and that
+            // silence is what made "highlight-to-add hasn't been working" undiagnosable
+            // from the logs: on 2026-08-15 all 57 dictations produced no auto-learn
+            // output whatsoever, and this was the only branch that could account for it
+            // (paste never failed, so Accessibility was granted, and the dictations were
+            // far longer than the two-token floor). Which apps fail to expose a focused
+            // element is still unmeasured — this line is what will measure it.
+            eprintln!(
+                "[whimpr] auto-learn: no focused UI element from the frontmost app \
+                 — not watching this dictation"
+            );
             return;
         }
         let holder = SendPtr(focused);

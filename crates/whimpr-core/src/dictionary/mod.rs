@@ -124,6 +124,143 @@ impl DictionaryStore {
         Some(format!("Glossary: {}.", terms.join(", ")))
     }
 
+    /// Apply the dictionary's known mishears to `text` deterministically, returning
+    /// the corrected text and how many replacements were made.
+    ///
+    /// This is the dictionary's **third** consumer and the only one that runs on
+    /// every dictation with a guaranteed result. [`Self::prefilter`] only reaches the
+    /// cleanup LLM, which `needs_cleanup()` skips on the large majority of
+    /// dictations; [`Self::asr_prompt`] only *biases* whisper's decoding and can be
+    /// overridden by the acoustics. Neither is a promise. This is: if a known mishear
+    /// is in the text, it leaves as the correct spelling, with no model involved.
+    ///
+    /// Rules, all deliberate:
+    ///
+    /// - **Word boundaries only.** A mishear is matched only when neither side is
+    ///   alphanumeric, so an entry for "clad" never rewrites "cladding".
+    /// - **Longest pattern first.** Multi-word mishears ("charge bee") win over any
+    ///   shorter pattern that overlaps them, so the more specific rule always applies.
+    /// - **One pass, left to right, no re-scanning.** Replaced text is never re-examined,
+    ///   so A→B→C chains and A→B→A loops are impossible by construction. Two entries
+    ///   that disagree produce a stable result rather than an order-dependent one.
+    /// - **The dictionary's spelling is authoritative**, used verbatim — that is the
+    ///   whole point of an entry that says "ChargeBee", "CUDA" or "KaTeX". The single
+    ///   exception is sentence-initial capitalization: a match whose first letter was
+    ///   uppercase keeps an uppercase first letter, so "wisper" opening a sentence
+    ///   becomes "Whisper" and not "whisper".
+    /// - **A mishear identical to its own correct spelling is skipped**, so an entry
+    ///   can never be a no-op that still counts as a replacement.
+    ///
+    /// Cost is O(text × rules) over a handful of entries and a sentence or two of
+    /// text — microseconds, with no allocation per candidate position. It belongs on
+    /// the hot lane; see the call site in `hotkey.rs`.
+    pub fn apply(&self, text: &str) -> (String, usize) {
+        let rules = self.replacement_rules();
+        if rules.is_empty() || text.is_empty() {
+            return (text.to_string(), 0);
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        let mut hits = 0;
+
+        let is_word = |c: char| c.is_alphanumeric();
+
+        while i < chars.len() {
+            // A match may only start on a word boundary.
+            let boundary_left = i == 0 || !is_word(chars[i - 1]);
+            let mut matched = None;
+            if boundary_left {
+                for (pattern, replacement) in &rules {
+                    let end = i + pattern.len();
+                    if end > chars.len() {
+                        continue;
+                    }
+                    let same = chars[i..end]
+                        .iter()
+                        .zip(pattern.iter())
+                        .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()));
+                    if !same {
+                        continue;
+                    }
+                    // …and end on one.
+                    if end < chars.len() && is_word(chars[end]) {
+                        continue;
+                    }
+                    matched = Some((end, replacement));
+                    break;
+                }
+            }
+
+            match matched {
+                Some((end, replacement)) => {
+                    let was_capitalized = chars[i..end]
+                        .iter()
+                        .find(|c| c.is_alphabetic())
+                        .is_some_and(|c| c.is_uppercase());
+                    push_replacement(&mut out, replacement, was_capitalized);
+                    hits += 1;
+                    i = end;
+                }
+                None => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+
+        (out, hits)
+    }
+
+    /// Flatten the store into `(mishear, correct)` character patterns, longest first.
+    ///
+    /// Sorting by length is what makes overlapping entries deterministic: with rules
+    /// for both "charge bee" and "bee", the longer one is always tried first, so the
+    /// result does not depend on the order entries happen to sit in the JSON file.
+    fn replacement_rules(&self) -> Vec<(Vec<char>, &str)> {
+        let mut rules: Vec<(Vec<char>, &str)> = Vec::new();
+        for e in &self.entries {
+            let correct = e.correct.trim();
+            if correct.is_empty() {
+                continue;
+            }
+            for m in &e.mishears {
+                let m = m.trim();
+                // Only an *exact* match is a no-op worth skipping. A mishear that
+                // differs from the correct spelling by case alone is a real
+                // correction — "Katex" → "KaTeX" is precisely the kind of entry a
+                // user adds by hand — so it must not be filtered out here.
+                if m.is_empty() || m == correct {
+                    continue;
+                }
+                rules.push((m.chars().collect(), correct));
+            }
+        }
+        rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        rules
+    }
+}
+
+/// Append `replacement`, upper-casing its first character when the text it replaced
+/// started with a capital. Everything after the first character is left exactly as the
+/// dictionary spells it, so internal capitals ("ChargeBee", "KaTeX") survive.
+fn push_replacement(out: &mut String, replacement: &str, capitalize: bool) {
+    let mut cs = replacement.chars();
+    match cs.next() {
+        Some(first) if capitalize && first.is_lowercase() => {
+            out.extend(first.to_uppercase());
+            out.push_str(cs.as_str());
+        }
+        Some(first) => {
+            out.push(first);
+            out.push_str(cs.as_str());
+        }
+        None => {}
+    }
+}
+
+impl DictionaryStore {
     /// Select the entries relevant to `utterance` — those whose spelling or a known
     /// mishear is edit-close to a spoken token (or adjacent token pair, to catch
     /// split words like "charge bee" → "ChargeBee") — capped to `max`.
@@ -228,6 +365,123 @@ mod tests {
         s.add("Zylophone", vec![], DictSource::Auto);
         let p = s.asr_prompt().unwrap();
         assert!(p.find("Manvi").unwrap() < p.find("Zylophone").unwrap(), "{p}");
+    }
+
+    #[test]
+    fn apply_replaces_a_known_mishear() {
+        let (out, n) = store().apply("send the deck to Monvi please");
+        assert_eq!(out, "send the deck to Manvi please");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn apply_is_case_insensitive_when_matching() {
+        // Whisper's casing of a mishear is not something we can rely on.
+        let (out, _) = store().apply("send it to MONVI and monvi");
+        assert_eq!(out, "send it to Manvi and Manvi");
+    }
+
+    #[test]
+    fn apply_respects_word_boundaries() {
+        // "monvi" inside a longer word is not the word we learned.
+        let (out, n) = store().apply("the monvirus spread and premonvi too");
+        assert_eq!(out, "the monvirus spread and premonvi too");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn apply_handles_multi_word_mishears() {
+        let (out, n) = store().apply("we should renew charge bee this month");
+        assert_eq!(out, "we should renew ChargeBee this month");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn apply_prefers_the_longest_pattern() {
+        // With rules for both "charge bee" and "bee", the longer one must win
+        // regardless of the order the entries sit in the store.
+        let mut s = DictionaryStore::default();
+        s.add("Bee", vec!["bee".into()], DictSource::Manual);
+        s.add("ChargeBee", vec!["charge bee".into()], DictSource::Manual);
+        let (out, n) = s.apply("renew charge bee now");
+        assert_eq!(out, "renew ChargeBee now");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn apply_uses_the_dictionary_spelling_verbatim() {
+        // Internal capitals are the reason the entry exists — never normalize them.
+        let mut s = DictionaryStore::default();
+        s.add("KaTeX", vec!["Katex".into()], DictSource::Manual);
+        let (out, _) = s.apply("rendered with Katex today");
+        assert_eq!(out, "rendered with KaTeX today");
+    }
+
+    #[test]
+    fn apply_capitalizes_at_the_start_of_a_sentence() {
+        // The one deliberate deviation from "verbatim": a capitalized match keeps a
+        // capital, so a lowercase entry does not lowercase the start of a sentence.
+        let mut s = DictionaryStore::default();
+        s.add("whisper", vec!["wisper".into()], DictSource::Manual);
+        let (out, _) = s.apply("Wisper is the model. I use wisper daily.");
+        assert_eq!(out, "Whisper is the model. I use whisper daily.");
+    }
+
+    #[test]
+    fn apply_never_chains_replacements() {
+        // Replaced text is not re-scanned, so A→B and B→C cannot compose into A→C,
+        // and A→B / B→A cannot loop. This is the property that makes the stage safe
+        // to run unconditionally on the hot lane.
+        let mut s = DictionaryStore::default();
+        s.add("bravo", vec!["alpha".into()], DictSource::Manual);
+        s.add("charlie", vec!["bravo".into()], DictSource::Manual);
+        let (out, n) = s.apply("alpha");
+        assert_eq!(out, "bravo");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn apply_fixes_a_case_only_mishear() {
+        // Case alone is a real correction, not a no-op — fixing "Katex" to "KaTeX" is
+        // exactly the kind of entry a user adds by hand.
+        let mut s = DictionaryStore::default();
+        s.add("Manvi", vec!["manvi".into()], DictSource::Manual);
+        let (out, n) = s.apply("hello manvi");
+        assert_eq!(out, "hello Manvi");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn apply_skips_a_mishear_identical_to_its_correct_spelling() {
+        // An exactly-equal pair is the only true no-op, and it must not inflate the
+        // replacement count.
+        let mut s = DictionaryStore::default();
+        s.add("Manvi", vec!["Manvi".into()], DictSource::Manual);
+        let (out, n) = s.apply("hello Manvi");
+        assert_eq!(out, "hello Manvi");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn apply_is_a_no_op_on_an_empty_dictionary() {
+        let (out, n) = DictionaryStore::default().apply("nothing to do here");
+        assert_eq!(out, "nothing to do here");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn apply_leaves_unrelated_text_byte_identical() {
+        let text = "The weather is nice today — 100% nicer, in fact.";
+        let (out, n) = store().apply(text);
+        assert_eq!(out, text);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn apply_matches_against_punctuation_boundaries() {
+        let (out, n) = store().apply("ask Monvi, then tell (monvi) again.");
+        assert_eq!(out, "ask Manvi, then tell (Manvi) again.");
+        assert_eq!(n, 2);
     }
 
     #[test]

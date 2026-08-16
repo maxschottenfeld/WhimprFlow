@@ -147,6 +147,12 @@ mod imp {
         asr_ms: u64,
         cleanup_fired: bool,
         cleanup_ms: u64,
+        /// Deterministic dictionary replacements applied on the hot lane.
+        dict_hits: usize,
+        /// Microseconds, not milliseconds — the stage is expected to round to 0ms and
+        /// a millisecond field would only ever record that it was free, which is not
+        /// evidence. This is the number that has to stay small.
+        dict_us: u64,
         paste_ms: u64,
         total_ms: u64,
     }
@@ -448,6 +454,27 @@ mod imp {
             if store.remove(correct) {
                 let _ = store.save(&dict_path());
             }
+        }
+    }
+
+    /// Apply the dictionary's known mishears to `text`, returning the corrected text
+    /// and the number of replacements.
+    ///
+    /// This is the hot lane's deterministic stage: no model, no network, no
+    /// conditional. It runs on **every** dictation, which is the whole point — the
+    /// dictionary's other two consumers are both best-effort. `prefilter()` only
+    /// reaches the cleanup LLM, and `needs_cleanup()` skipped it on 186 of the 201
+    /// dictations logged between 2026-08-08 and 08-15; `asr_prompt()` only biases
+    /// whisper and loses to the acoustics often enough that "Whimprflow" was still
+    /// being transcribed "Wimperslow" with the entry already in the dictionary.
+    ///
+    /// Returns the input unchanged when the store is missing or the lock is poisoned:
+    /// a dictation that pastes uncorrected text is a far better failure than one that
+    /// pastes nothing.
+    fn dictionary_apply(text: &str) -> (String, usize) {
+        match DICTIONARY.get().and_then(|m| m.lock().ok()) {
+            Some(store) => store.apply(text),
+            None => (text.to_string(), 0),
         }
     }
 
@@ -806,6 +833,21 @@ mod imp {
                             if text != raw {
                                 eprintln!("[whimpr] CLEANED:   \"{}\"", text);
                             }
+                            // Hot lane, deterministic stage. Placed *after* cleanup on
+                            // purpose: cleanup is an LLM and can rewrite a word we just
+                            // fixed, so the dictionary has to get the last word for the
+                            // correction to actually be a guarantee. Cleanup is not left
+                            // blind by this — `prefilter()` already puts the relevant
+                            // entries in its prompt.
+                            let t_dict = Instant::now();
+                            let (text, dict_hits) = dictionary_apply(&text);
+                            let us_dict = t_dict.elapsed().as_micros();
+                            if dict_hits > 0 {
+                                eprintln!(
+                                    "[whimpr] DICTIONARY: \"{}\" ({} replacement(s), {}µs)",
+                                    text, dict_hits, us_dict
+                                );
+                            }
                             if !text.is_empty() {
                                 let t_paste = Instant::now();
                                 if let Err(e) = crate::paste::paste_text(&text) {
@@ -838,6 +880,8 @@ mod imp {
                                     asr_ms: ms_asr as u64,
                                     cleanup_fired,
                                     cleanup_ms: ms_clean as u64,
+                                    dict_hits,
+                                    dict_us: us_dict as u64,
                                     paste_ms: ms_paste as u64,
                                     total_ms: ms_total as u64,
                                 };
