@@ -185,6 +185,19 @@ mod imp {
                     Some(after) => {
                         reads_ok += 1;
                         consecutive_failures = 0;
+                        // Per-poll trace. The end-of-session summary reports only the
+                        // FINAL read, and on the first real run (2026-08-16, Max's
+                        // "option one" test) that hid the one thing worth knowing:
+                        // whether the user's correction was ever visible at all. The
+                        // final read was Claude Code's *placeholder* text, so the
+                        // whole edit window was invisible between two log lines.
+                        let (nrem, nadd) = super::diff_shape(&inserted, &after);
+                        eprintln!(
+                            "[whimpr] auto-learn: poll {}/{} -{nrem} +{nadd} field={:?}",
+                            i + 1,
+                            POLL_GAPS_MS.len(),
+                            super::preview_text(&after),
+                        );
                         if after.trim().is_empty() {
                             // The field emptied under us — the overwhelmingly likely
                             // cause is the user sending the message. Worth counting
@@ -395,6 +408,28 @@ pub fn rejection_reason(inserted: &str, after: &str) -> String {
 /// First few words of a diff list, so a 200-word field does not fill the log.
 fn preview(words: &[String]) -> Vec<&str> {
     words.iter().take(4).map(|w| w.as_str()).collect()
+}
+
+/// How many distinct words differ each way, for the per-poll trace. `(0, 0)` when
+/// either side is wordless.
+pub fn diff_shape(inserted: &str, after: &str) -> (usize, usize) {
+    word_diff(inserted, after).map_or((0, 0), |(rem, add)| (rem.len(), add.len()))
+}
+
+/// A short, single-line window onto the field, so the trace shows *what* was read
+/// without dumping a whole document into the log on every poll.
+///
+/// This exists because the field turned out to contain things no one predicted —
+/// Claude Code reports its empty input box as the placeholder `"Type / for commands"`,
+/// which is why the emptied-field check never fired on the first real run.
+pub fn preview_text(s: &str) -> String {
+    const MAX: usize = 48;
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX {
+        return flat;
+    }
+    let head: String = flat.chars().take(MAX).collect();
+    format!("{head}…")
 }
 
 /// Detect a single clean one-word correction: exactly one word removed from the
