@@ -745,7 +745,32 @@ mod imp {
         }
         std::thread::spawn(|| {
             eprintln!("[whimpr] math worker: loading (first use — this takes a few seconds)");
-            let w = crate::local_llm::spawn_math();
+            let t = Instant::now();
+            let mut w = crate::local_llm::spawn_math();
+            // 🔴 Spawning is NOT loading, and the difference is the whole point of
+            // starting early. `spawn` returns as soon as the child PROCESS exists;
+            // llama.cpp then loads the GGUF lazily, so without this the load lands
+            // inside the user's first real request instead. Measured 2026-08-17:
+            // first math dictation 8500 ms versus 5125 ms warm — a 3.4 s penalty
+            // that the key-down head start appeared to remove and did not.
+            //
+            // So force the load here, on this thread, with a throwaway request.
+            // Its content does not matter and its answer is discarded; what
+            // matters is that it returns only once the model is resident.
+            if let Some(worker) = w.as_mut() {
+                let warm = [whimpr_core::cleanup::CleanupMsg {
+                    role: "user",
+                    content: "hi".to_string(),
+                }];
+                match worker.request(&warm, 1) {
+                    Ok(_) => eprintln!("[whimpr] math worker: ready ({} ms)", t.elapsed().as_millis()),
+                    // A failed warmup is worth saying out loud but not worth
+                    // discarding the worker over — the real request may still
+                    // work, and dropping it here would turn a warning into a
+                    // silently dead feature.
+                    Err(e) => eprintln!("[whimpr] ⚠ math worker warmup failed ({e}) — keeping it anyway"),
+                }
+            }
             let slot = MATH_LOCAL.get_or_init(|| Mutex::new(None));
             *slot.lock().unwrap() = w;
             MATH_SPAWNING.store(false, Ordering::SeqCst);
@@ -1135,6 +1160,15 @@ mod imp {
         if etype == K_CG_EVENT_FLAGS_CHANGED {
             let keycode =
                 unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+            // ✅ ANSWERED 2026-08-17: **Fn's flagsChanged event does carry the
+            // Shift bit**, so the math gesture works on stable exactly as it does
+            // on dev. Measured with a temporary probe on this line, pressing
+            // Shift+Fn: `flags=0x00820102 shift=true fn=true`. This was worth
+            // checking rather than assuming — Fn is not an ordinary modifier, and
+            // had it not carried Shift, the feature would have installed over the
+            // daily driver and silently done nothing, looking like a bad build.
+            // The probe is deleted; the answer is the reason it does not need to
+            // exist.
             if keycode == KEYCODE_HOTKEY {
                 let flags = unsafe { CGEventGetFlags(event) };
                 let down = (flags & FLAG_HOTKEY_MODIFIER) != 0;
