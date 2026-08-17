@@ -178,6 +178,13 @@ mod imp {
             // answered by guessing. These three track the shape of what was seen.
             let mut last_text: Option<String> = None;
             let mut empty_reads = 0usize;
+            // The read that came CLOSEST to being a correction, i.e. the smallest
+            // non-zero `removed + added`. Explaining the *last* read instead was
+            // actively misleading on the first run: the field's final state was a
+            // placeholder, so the summary blamed a 12-word diff while poll 3 had seen
+            // a clean 1-for-1 swap and a gate had thrown it away. The near-miss is the
+            // interesting read; the final one only says whether the text was sent.
+            let mut best: Option<(usize, String)> = None;
 
             for (i, gap) in POLL_GAPS_MS.iter().enumerate() {
                 std::thread::sleep(Duration::from_millis(*gap));
@@ -206,6 +213,10 @@ mod imp {
                             empty_reads += 1;
                         } else {
                             last_text = Some(after.clone());
+                            let score = nrem + nadd;
+                            if score > 0 && best.as_ref().is_none_or(|(b, _)| score < *b) {
+                                best = Some((score, after.clone()));
+                            }
                         }
                         if let Some((mishear, correct)) =
                             super::detect_correction(&inserted, &after)
@@ -248,9 +259,10 @@ mod imp {
                     );
                     // ...and *why*. Judged on the last non-empty read, because that
                     // is the state closest to what the user actually left behind.
-                    match &last_text {
+                    match best.as_ref().map(|(_, t)| t).or(last_text.as_ref()) {
                         Some(after) => eprintln!(
-                            "[whimpr] auto-learn: WHY: {} (empty reads: {empty_reads}/{reads_ok})",
+                            "[whimpr] auto-learn: WHY: {} (closest read; empty reads: \
+                             {empty_reads}/{reads_ok})",
                             super::rejection_reason(&inserted, after)
                         ),
                         None => eprintln!(
@@ -632,6 +644,41 @@ mod tests {
         let r = rejection_reason("fix this word", "i had already typed a lot here fix this term");
         assert!(r.contains("not a 1-for-1 swap"), "{r}");
         assert!(r.contains("counts as added"), "{r}");
+    }
+
+    /// Observed in the wild, 2026-08-16: Max dictated "…the Find and Replace system",
+    /// corrected "Replace" to "Re-Place", and poll 3 saw a clean `-1 +1`. It was still
+    /// not learned — `word_tokens` only trims non-alphanumerics from the *ends* of a
+    /// token, so the interior hyphen survives and the all-alphabetic gate rejects it.
+    ///
+    /// Hyphenated and possessive corrections are ordinary English, so this quietly
+    /// discards a whole class of real fixes.
+    #[test]
+    fn an_interior_hyphen_rejects_an_otherwise_perfect_correction() {
+        let ins = "a test for the Find and Replace system";
+        let aft = "a test for the Find and Re-Place system";
+        assert_eq!(word_diff(ins, aft), Some((vec!["Replace".into()], vec!["Re-Place".into()])));
+        assert_eq!(detect_correction(ins, aft), None);
+        assert!(rejection_reason(ins, aft).contains("non-alphabetic"));
+    }
+
+    /// Observed in the wild, 2026-08-16, and it settles project.md §8 item 3: the
+    /// watcher reads the field *mid-edit*. Max was still typing when poll 5 fired and
+    /// it learned `"Hypothesis" -> "Hypothe"` — a truncation, written to the dictionary
+    /// as authoritative.
+    ///
+    /// The gate that should have caught this is the one that lets it through:
+    /// a truncation is a *prefix*, so its edit distance is small by construction. The
+    /// phonetic-closeness test does not merely fail to reject mid-edit captures, it
+    /// actively selects for them.
+    #[test]
+    fn a_mid_edit_truncation_passes_every_gate() {
+        assert_eq!(
+            detect_correction("look at the Riemann Hypothesis", "look at the Riemann Hypothe"),
+            Some(("Hypothesis".to_string(), "Hypothe".to_string()))
+        );
+        // …and it is "close" precisely because it is a prefix of the real word.
+        assert!(norm_levenshtein("Hypothesis", "Hypothe") < 0.6);
     }
 
     #[test]
