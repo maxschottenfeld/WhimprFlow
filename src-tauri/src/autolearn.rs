@@ -172,16 +172,15 @@ mod imp {
         /// Does this terminator prove the user *finished editing*?
         ///
         /// This is load-bearing, because it decides how much evidence is needed
-        /// before writing to the dictionary. The in-window path requires a candidate
-        /// to survive two consecutive polls — that rule exists because a read taken
-        /// mid-keystroke looks exactly like a finished correction, and on 2026-08-16
-        /// one wrote `"Hypothesis" -> "Hypothe"` from a single observation.
+        /// before writing to the dictionary. A read taken mid-keystroke looks exactly
+        /// like a finished correction, and on 2026-08-16 one wrote
+        /// `"Hypothesis" -> "Hypothe"` from a single observation.
         ///
-        /// A semantic terminator supplies that same assurance by a different route:
-        /// if the user has moved on to another dictation, or sent the message, the
-        /// text they left behind **is** the finished state. Waiting for it to "hold"
-        /// is meaningless once nothing can change it again. A timeout proves nothing
-        /// of the kind — the user may be mid-word — so it keeps the stricter rule.
+        /// If the user has moved on to another dictation, or sent the message, the
+        /// text they left behind **is** the finished state — nothing can change it
+        /// again, so there is nothing left to wait for. A timeout proves nothing of
+        /// the kind, and the caller must establish settledness the other way (the
+        /// final two reads being identical) before learning from one.
         fn is_settled(self) -> bool {
             matches!(self, Self::NextDictationStarted | Self::TextboxEmptied)
         }
@@ -332,6 +331,12 @@ mod imp {
             // closes on a semantic terminator. That is the entire point of the change:
             // the reads were always being taken, and were being thrown away.
             let mut last_text: Option<String> = None;
+            // The read before `last_text`. On a timeout it is the only evidence
+            // available about whether the user had stopped typing: if the final two
+            // reads are identical the text was still for the tail of the window, and
+            // an intermediate state cannot be one — by definition something came after
+            // it. See the termination block.
+            let mut prev_text: Option<String> = None;
             let mut empty_reads = 0usize;
             // The read that came CLOSEST to being a correction, i.e. the smallest
             // non-zero `removed + added`. Explaining the *last* read instead was
@@ -378,11 +383,23 @@ mod imp {
                         // final read was Claude Code's *placeholder* text, so the
                         // whole edit window was invisible between two log lines.
                         let (nrem, nadd) = super::diff_shape(&inserted, &after);
+                        // Print the REGION being judged, not a preview of the whole
+                        // field. In a document the first 48 characters are prior text,
+                        // identical on every poll — four live tests on 2026-08-17
+                        // produced traces where the corrected word never appeared once.
+                        // The labels come along because they say how the region was
+                        // read, which is the other half of any post-mortem.
+                        let v = whimpr_core::editshape::analyse_in_region(
+                            &inserted, &after, &prior,
+                        );
                         eprintln!(
-                            "[whimpr] auto-learn: poll {}/{} -{nrem} +{nadd} field={:?}",
+                            "[whimpr] auto-learn: poll {}/{} -{nrem} +{nadd} [{}] region={:?}",
                             i + 1,
                             POLL_GAPS_MS.len(),
-                            super::preview_text(&after),
+                            v.labels,
+                            super::preview_text(&whimpr_core::editshape::region_text(
+                                &after, &prior
+                            )),
                         );
                         if after.trim().is_empty() {
                             // The field emptied under us — the overwhelmingly likely
@@ -413,43 +430,51 @@ mod imp {
                                     );
                                 }
                             }
-                            last_text = Some(after.clone());
+                            // Keep the read before last, so termination can ask whether
+                            // the text was still moving when the window ran out.
+                            prev_text = last_text.replace(after.clone());
                             let score = nrem + nadd;
                             if score > 0 && best.as_ref().is_none_or(|(b, _)| score < *b) {
                                 best = Some((score, after.clone()));
                             }
                         }
-                        // A correction must survive TWO CONSECUTIVE polls before it is
-                        // written. A real correction is something the user typed and
-                        // then left alone; a mid-edit read is gone by the next poll,
-                        // because they are still typing. On 2026-08-16 this exact loop
-                        // caught Max part-way through a word and wrote
-                        // "Hypothesis" -> "Hypothe" to the dictionary from a single
-                        // observation — with `apply()` now live on the hot lane, that
-                        // would have started silently rewriting the word in every
-                        // dictation. One sample is not evidence that an edit is done.
+                        // 🔴 NOTHING IS LEARNED HERE — changed 2026-08-17, and this is
+                        // the whole point of the change. This branch used to write to
+                        // the dictionary the moment a candidate survived two
+                        // consecutive polls, and then `break` out of the ladder.
+                        //
+                        // That is wrong for a reason no unit test could have shown,
+                        // and it took Max's own live test to expose: "held for two
+                        // polls" is only "unchanged for ~2 seconds", and a user who
+                        // types a spelling, pauses to look at it, and *then* fixes it
+                        // further satisfies it trivially. On 2026-08-17 he corrected
+                        // `derelict` toward `Dirichlet`; poll 4 (t=6.0s) and poll 5
+                        // (t=8.0s) both read the intermediate `Dirilecht`, so it was
+                        // written and the watcher quit with 12 of its 20 seconds
+                        // unused. His note settled on `dirichlet`. The dictionary
+                        // learned a state he had already moved past, and could not
+                        // see the state he left, because it had stopped looking.
+                        //
+                        // Learning early also *causes* the blindness: whatever the
+                        // user does next is unobservable once the thread is gone. So
+                        // the decision now happens exactly once, at termination, over
+                        // the reads this loop accumulated — see the block after it.
+                        // The candidate is still tracked, but only to say so in the
+                        // log, which is what makes a session like tonight's readable
+                        // afterwards.
                         match super::detect_correction_in(&inserted, &after, &prior) {
-                            Some(pair) if pending.as_ref() == Some(&pair) => {
-                                let (mishear, correct) = pair;
-                                eprintln!(
-                                    "[whimpr] ✨ auto-learned: \"{mishear}\" -> \"{correct}\" \
-                                     (held across 2 polls, confirmed at {}/{})",
-                                    i + 1,
-                                    POLL_GAPS_MS.len()
-                                );
-                                crate::hotkey::dictionary_learn(correct, vec![mishear]);
-                                learned = true;
-                                break;
-                            }
                             Some(pair) => {
-                                eprintln!(
-                                    "[whimpr] auto-learn: candidate \"{}\" -> \"{}\" at poll \
-                                     {}/{} — waiting for it to hold",
-                                    pair.0,
-                                    pair.1,
-                                    i + 1,
-                                    POLL_GAPS_MS.len()
-                                );
+                                if pending.as_ref() != Some(&pair) {
+                                    eprintln!(
+                                        "[whimpr] auto-learn: candidate \"{}\" -> \"{}\" at \
+                                         poll {}/{} — noted, decision deferred to the end \
+                                         of the window",
+                                        pair.0,
+                                        pair.1,
+                                        i + 1,
+                                        POLL_GAPS_MS.len()
+                                    );
+                                }
                                 pending = Some(pair);
                             }
                             None => pending = None,
@@ -502,18 +527,32 @@ mod imp {
             //  2. It runs **only** for a settled terminator. On a timeout the user
             //     may be mid-word, so the two-consecutive-poll rule still governs;
             //     relaxing that is how `"Hypothesis" -> "Hypothe"` got written.
+            // A timeout does not prove the user stopped typing — but the reads do,
+            // when the last two of them are identical. That is a strictly stronger
+            // claim than the old in-window rule made: "unchanged across the final two
+            // polls of the window" cannot be satisfied by a state the user later
+            // edited, whereas "unchanged across any two polls" is satisfied by every
+            // pause mid-edit. This is what keeps the timeout path alive without
+            // reopening the hole that produced `Dirilecht`.
+            let settled = super::window_settled(
+                end_reason.is_settled(),
+                prev_text.as_deref(),
+                last_text.as_deref(),
+            );
+
             if !learned {
                 if let Some((mishear, correct)) = super::finalize_observation(
                     &inserted,
                     best.as_ref().map(|(_, t)| t.as_str()),
                     last_text.as_deref(),
-                    end_reason.is_settled(),
+                    settled,
                     &prior,
                 ) {
                     eprintln!(
                         "[whimpr] ✨ auto-learned: \"{mishear}\" -> \"{correct}\" \
-                         (settled on {})",
-                        end_reason.label()
+                         (settled on {}{})",
+                        end_reason.label(),
+                        if end_reason.is_settled() { "" } else { ", text unchanged at the end" }
                     );
                     crate::hotkey::dictionary_learn(correct, vec![mishear]);
                     learned = true;
@@ -747,6 +786,36 @@ pub fn detect_correction_in(
     whimpr_core::editshape::learn_from(inserted, after, prior)
 }
 
+/// Can the text still be mid-edit when the window closes?
+///
+/// Pulled out of the poll loop for the same reason [`finalize_observation`] was: the loop
+/// needs an Accessibility handle, a focused field and 20 seconds, so anything left inside
+/// it is in practice untested. This rule is the entire defence against learning a spelling
+/// the user abandoned, so it is the last thing that should be untestable.
+///
+/// - `terminator_settled` — the window ended on a semantic event (next dictation, send).
+///   The user has moved on; what they left is final.
+/// - otherwise the window timed out, and the only evidence is the reads: the **final two
+///   being identical** means the text was still for the tail of the window.
+///
+/// 🔴 The anchoring is the fix, not the "two polls" (2026-08-17). The rule this replaced
+/// accepted a candidate unchanged across *any* two consecutive polls — about 2 seconds —
+/// which a user who types a spelling, pauses to look at it, and then fixes it further
+/// satisfies without trying. Anchored at the end of the window instead, an abandoned state
+/// cannot qualify by construction: something came after it.
+pub fn window_settled(
+    terminator_settled: bool,
+    prev_text: Option<&str>,
+    last_text: Option<&str>,
+) -> bool {
+    if terminator_settled {
+        return true;
+    }
+    // Two reads are required. One read is a single observation, which is exactly what
+    // wrote `"Hypothesis" -> "Hypothe"`.
+    matches!((prev_text, last_text), (Some(p), Some(l)) if p == l)
+}
+
 /// Decide what, if anything, to learn when an observation window closes.
 ///
 /// Split out of the poll loop so the *policy* can be tested without an
@@ -759,18 +828,32 @@ pub fn detect_correction_in(
 /// - `last_text` is the last non-empty read — the state the user actually left.
 /// - `settled` says whether the terminator proves the user finished editing.
 ///
-/// Both candidates are tried, in that order, because they disagree in a real case:
-/// a stray extra word elsewhere in the field can make some other read "closer" while
-/// the actual correction sits in the final one.
+/// 🔴 **`last_text` is tried FIRST, and the order is load-bearing** (fixed 2026-08-17).
+/// It used to try `best` first, which is the near-miss read — and on a window where the
+/// user corrected a word *twice*, the near-miss is the FIRST spelling they tried, not the
+/// one they kept. Both are clean 1-for-1 swaps scoring the same, and `best` keeps the
+/// earliest of equal scores, so best-first re-learns the abandoned state. That is exactly
+/// the `Dirilecht` failure, and moving the decision to termination would not have fixed it
+/// on its own: the loop would have stopped writing the intermediate spelling early only to
+/// write the same intermediate spelling at the end.
+///
+/// `best` remains as the fallback for the case it was added for: the final read being
+/// something other than the user's text — Claude Code's `Type / for commands` placeholder
+/// is the observed one — where the correction really does sit in an earlier read.
 ///
 /// 🔴 **`settled` is not decoration.** A single observation is exactly what wrote
 /// `"Hypothesis" -> "Hypothe"` to the dictionary on 2026-08-16, caught mid-keystroke.
-/// The in-window path defends against that by requiring a candidate to survive two
-/// consecutive polls. This path may skip that rule *only* because a semantic
-/// terminator supplies the same assurance another way — once the user has moved to
-/// the next dictation or sent the message, the text cannot change again, so waiting
-/// for it to "hold" would prove nothing that has not already been proven. On a
-/// timeout none of that holds, and this returns `None`.
+/// The caller establishes it one of two ways, and both mean "the text cannot still be
+/// mid-edit": a **semantic terminator** (the user moved to the next dictation, or sent
+/// the message — the text they left behind *is* the finished state and nothing can
+/// change it again), or, on a timeout, the **final two reads being identical**.
+///
+/// The second is what replaced the old in-window rule on 2026-08-17. Both are "held
+/// across two polls"; the difference is *which* two, and it is the difference between a
+/// guard that works and one that does not. Anchored at the end of the window, a state
+/// the user later edited can never qualify — something came after it. Anchored anywhere
+/// in the window, every pause mid-edit qualifies, which is how `Dirilecht` was learned
+/// while `dirichlet` sat unread in the field.
 pub fn finalize_observation(
     inserted: &str,
     best: Option<&str>,
@@ -781,10 +864,28 @@ pub fn finalize_observation(
     if !settled {
         return None;
     }
-    [best, last_text]
-        .into_iter()
-        .flatten()
-        .find_map(|candidate| detect_correction_in(inserted, candidate, prior))
+    // 🔴 The final read gets the FIRST and, if it has anything to say, the ONLY word.
+    //
+    // If the user's last state contains an edit at all, that edit is their answer —
+    // accepting it or rejecting it are both fine, but *overruling* it with an earlier
+    // read is not. Falling through on a vocabulary rejection is what made the ordering
+    // fix insufficient on its own: with `derelict → Dirichlet` rejected as too distant,
+    // the search continued and found `derelict → Dirilecht` in the near-miss read — the
+    // spelling the user had visibly abandoned. Rejecting their final answer and then
+    // learning their discarded one is worse than learning nothing.
+    //
+    // `best` is reached only when the final read holds no edit whatsoever, which is the
+    // case it was added for: the field showing something that is not the user's text
+    // (Claude Code's `Type / for commands` placeholder, observed 2026-08-16).
+    if let Some(last) = last_text {
+        if whimpr_core::editshape::analyse_in_region(inserted, last, prior)
+            .correction
+            .is_some()
+        {
+            return detect_correction_in(inserted, last, prior);
+        }
+    }
+    best.and_then(|candidate| detect_correction_in(inserted, candidate, prior))
 }
 
 /// Is `candidate` a strict prefix of `original`, short by 2 or more characters?
@@ -1080,6 +1181,118 @@ mod tests {
         assert_eq!(
             finalize(inserted, Some(corrected), Some(corrected), false),
             None
+        );
+    }
+
+    /// 🔴 The `Dirilecht` regression, pinned. Max corrected `derelict` twice on
+    /// 2026-08-17: first to an intermediate spelling, then to the one he kept. Both
+    /// reads are clean 1-for-1 swaps scoring identically, so `best` — which keeps the
+    /// earliest of equal scores — holds the spelling he ABANDONED, and `last_text`
+    /// holds the one he left.
+    ///
+    /// This fails against the old `[best, last_text]` ordering, which is the point:
+    /// moving the decision to the end of the window does not fix anything on its own
+    /// if the end still prefers the earlier read.
+    #[test]
+    fn the_spelling_the_user_kept_beats_the_one_they_abandoned() {
+        let inserted = "i use Wimperslow every day";
+        let abandoned = "i use Whimprflows every day";
+        let kept = "i use Whimprflow every day";
+        // Both are learnable in their own right — the test is which one wins. Without
+        // that, this would pass for the wrong reason.
+        assert!(detect_correction(inserted, abandoned).is_some());
+        assert!(detect_correction(inserted, kept).is_some());
+        assert_eq!(
+            finalize(inserted, Some(abandoned), Some(kept), true),
+            Some(("Wimperslow".into(), "Whimprflow".into())),
+            "learned the spelling the user moved past, not the one they left"
+        );
+    }
+
+    /// 🔴 Max's actual 2026-08-17 case, end to end. This is the one the whole day was
+    /// about: he dictated `derelict`, typed `Dirilecht`, paused, then fixed it to
+    /// `dirichlet` and left it.
+    ///
+    /// It needed BOTH changes. The termination rewrite makes the final read the one
+    /// that counts; raising [`MAX_MISHEAR_DISTANCE`] to 0.70 lets his real correction
+    /// (0.667) through the vocabulary gate at all. Either alone learns the typo or
+    /// learns nothing.
+    #[test]
+    fn the_dirichlet_case_learns_the_spelling_he_kept() {
+        let inserted = "the derelict problem is harder to solve";
+        let abandoned = "the Dirilecht problem is harder to solve";
+        let kept = "the Dirichlet problem is harder to solve";
+        assert_eq!(
+            finalize(inserted, Some(abandoned), Some(kept), true),
+            Some(("derelict".into(), "Dirichlet".into()))
+        );
+    }
+
+    /// Having refused the user's final answer, the search must not go and learn the one
+    /// they discarded. Refusing their answer and adopting their abandoned one is the
+    /// worst of the three outcomes, and it is what a plain `[last, best]` fallback does.
+    #[test]
+    fn a_correction_too_distant_to_learn_does_not_fall_back_to_an_abandoned_one() {
+        let inserted = "i use Wimperslow every day";
+        let abandoned = "i use Whimprflow every day";
+        let kept = "i use Photosynthesis every day";
+        assert!(
+            detect_correction(inserted, abandoned).is_some(),
+            "the abandoned spelling IS learnable — which is exactly the hazard"
+        );
+        assert!(
+            detect_correction(inserted, kept).is_none(),
+            "the kept word must be beyond the distance ceiling for this test to mean anything"
+        );
+        assert_eq!(finalize(inserted, Some(abandoned), Some(kept), true), None);
+    }
+
+    /// A timeout still learns — but only when the text stopped moving before the
+    /// window ran out. Without this the fix would silently drop every
+    /// correct-it-and-walk-away case, which is not a trade anyone agreed to.
+    #[test]
+    fn a_timeout_is_settled_only_when_the_last_two_reads_agree() {
+        assert!(
+            window_settled(false, Some("same text"), Some("same text")),
+            "text was still for the tail of the window"
+        );
+        assert!(
+            !window_settled(false, Some("still typing"), Some("still typing more")),
+            "text was moving when the window ran out"
+        );
+        // One read is a single observation. That is what wrote "Hypothesis" -> "Hypothe".
+        assert!(!window_settled(false, None, Some("only ever read once")));
+        // A semantic terminator needs no such evidence: nothing can change the text now.
+        assert!(window_settled(true, None, Some("sent")));
+    }
+
+    /// The mid-edit pause that defeated the old rule, expressed as the reads a window
+    /// actually takes. Polls 4 and 5 agree on the abandoned spelling — the old
+    /// in-window rule learned right there and stopped watching — but they are not the
+    /// FINAL two reads, and the final two hold what the user kept.
+    #[test]
+    fn a_pause_mid_edit_no_longer_looks_like_a_finished_correction() {
+        let inserted = "i use Wimperslow every day";
+        let reads = [
+            "i use Wimperslow every day",
+            "i use Whimprflows every day", // poll 4 — typed, then paused
+            "i use Whimprflows every day", // poll 5 — the old in-window rule fired HERE
+            "i use Whimprflow every day",  // poll 6 — kept fixing
+            "i use Whimprflow every day",  // poll 7 — and left it
+        ];
+        let (prev, last) = (reads[reads.len() - 2], reads[reads.len() - 1]);
+        // The old rule's evidence — two agreeing polls — is present at 4/5 and means
+        // nothing now, because it is not the tail of the window.
+        assert_eq!(reads[1], reads[2]);
+        assert!(window_settled(false, Some(prev), Some(last)));
+        assert_eq!(
+            finalize(inserted, Some(reads[1]), Some(last), false),
+            None,
+            "an unsettled window learns nothing regardless of what it saw"
+        );
+        assert_eq!(
+            finalize(inserted, Some(reads[1]), Some(last), true),
+            Some(("Wimperslow".into(), "Whimprflow".into()))
         );
     }
 

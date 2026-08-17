@@ -20,8 +20,11 @@
 use std::collections::HashSet;
 
 use whimpr_core::editshape::{
-    analyse_in_region, is_learnable_pair, word_tokens, PriorContext,
+    analyse_in_region, is_learnable_pair, is_learnable_pair_at, word_tokens, PriorContext,
 };
+
+/// Distance ceilings to sweep with `--sweep`. 0.6 is what ships.
+const SWEEP: &[f32] = &[0.55, 0.60, 0.65, 0.667, 0.70, 0.75];
 
 /// The OLD detector's shape rule, restated for before/after comparison.
 ///
@@ -67,6 +70,13 @@ fn main() {
     // no surrounding-document text at all and the whole-field defect is invisible in it.
     // Embedding the same real edits in real prior text is what exercises the fix.
     let embed = std::env::args().any(|a| a == "--embed");
+    // `--sweep` reports what each distance ceiling would learn, so the gate can be
+    // retuned against evidence. Every accepted pair is printed per threshold: the
+    // number alone is useless here, because the question is not "how many more" but
+    // "is the extra one a word or is it noise".
+    let sweep = std::env::args().any(|a| a == "--sweep");
+    let mut swept: Vec<(f32, Vec<(String, String)>)> =
+        SWEEP.iter().map(|t| (*t, Vec::new())).collect();
     let mut pairs = 0usize;
     let mut accepted = 0usize;
     let mut old_shape_ok = 0usize;
@@ -113,6 +123,14 @@ fn main() {
             .into_iter().collect();
         *shapes.entry(if key.is_empty() { "(none)".into() } else { key }).or_default() += 1;
 
+        if let Some((mishear, correct)) = v.correction.clone() {
+            for (t, hits) in swept.iter_mut() {
+                if is_learnable_pair_at(&mishear, &correct, *t).is_none() {
+                    hits.push((mishear.clone(), correct.clone()));
+                }
+            }
+        }
+
         if let Some((mishear, correct)) = v.correction {
             new_shape_ok += 1;
             if is_learnable_pair(&mishear, &correct).is_none() {
@@ -151,6 +169,24 @@ fn main() {
         println!("\nwhat it would learn (check every one — this is not ground truth):");
         for (m, c, l) in &examples {
             println!("  {l:<14} {m:?} -> {c:?}");
+        }
+    }
+
+    if sweep {
+        println!("\ndistance-ceiling sweep — what each threshold admits:");
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (t, hits) in &swept {
+            let ship = if (*t - 0.60).abs() < 1e-6 { "  <- ships today" } else { "" };
+            println!("\n  ceiling {t:.3} : {} learned{ship}", hits.len());
+            for (m, c) in hits {
+                let is_new = !seen.iter().any(|(a, b)| a == m && b == c);
+                println!("      {} {m:?} -> {c:?}", if is_new { "NEW" } else { "   " });
+            }
+            for h in hits {
+                if !seen.contains(h) {
+                    seen.push(h.clone());
+                }
+            }
         }
     }
 }

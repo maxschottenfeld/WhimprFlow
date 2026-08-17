@@ -342,6 +342,20 @@ impl PriorContext {
     }
 }
 
+/// The part of the field the watcher is actually judging — the pasted region, with the
+/// surrounding document removed.
+///
+/// **Exists for the logs, and it is not a nicety.** The poll trace printed a 48-character
+/// preview of the whole field, which in a real document is 48 characters of *someone
+/// else's text*: on 2026-08-17 four consecutive live tests produced traces in which every
+/// read looked identical, and the one thing worth seeing — which word was sitting where
+/// the correction goes — was never on screen. A diagnostic that cannot distinguish the
+/// cases it exists to diagnose is worse than none, because it looks like evidence.
+pub fn region_text(field: &str, prior: &PriorContext) -> String {
+    let tokens = word_tokens(field);
+    prior.strip(&tokens).join(" ")
+}
+
 /// Re-label edge substitutions that look like a mid-keystroke read.
 ///
 /// Applied *after* region trimming, because "edge" means the edge of the pasted
@@ -572,6 +586,46 @@ fn is_truncation_of(candidate: &str, original: &str) -> bool {
 /// (`"In bed" → "Embed"`), and rejecting it here would undo the main gain of the shape
 /// rewrite.
 pub fn is_learnable_pair(mishear: &str, correct: &str) -> Option<&'static str> {
+    is_learnable_pair_at(mishear, correct, MAX_MISHEAR_DISTANCE)
+}
+
+/// The distance ceiling in [`is_learnable_pair`]. A pair further apart than this is not
+/// treated as a plausible mishear.
+///
+/// **0.6 → 0.70 on 2026-08-17, and the number was swept, not guessed.** At 0.6 the gate
+/// rejected `derelict → Dirichlet` (0.667) while accepting the typo `derelict → Dirilecht`
+/// (0.444) — and Max's *stable* dictionary already contained `Dirichlet ← Derelict` as a
+/// hand-added entry, so auto-learn could not produce an entry he had made himself.
+///
+/// Swept over the 46 real edit pairs embedded in real prior text
+/// (`cargo run --example shape-dryrun -- --embed --sweep`):
+///
+/// | ceiling | learned |
+/// |---|---|
+/// | 0.55 | 5 |
+/// | 0.60 | 6 (adds `"Reimann" → "Domain"`) |
+/// | 0.65 · 0.667 · 0.70 · 0.75 | 6 — **no new pairs at all** |
+///
+/// So the move costs nothing measured. Note what the same sweep says about the old
+/// number: the junk pair this gate's docs cite as its justification, `Reimann → Domain`,
+/// was admitted *at 0.6* and is excluded only by tightening to 0.55. The gate was never
+/// separating those two cases.
+///
+/// ⚠️ **n = 46 (14 passing shape).** Zero new admits in the (0.60, 0.75] band may mean the
+/// band is safe or may mean this corpus has no pairs in it. Character edit distance is a
+/// poor stand-in for phonetic similarity — *DIR-ish-lay* and *de-REL-ict* sound alike and
+/// spell far apart — and a phonetic comparison, not a looser threshold, is the real fix.
+pub const MAX_MISHEAR_DISTANCE: f32 = 0.70;
+
+/// [`is_learnable_pair`] with the distance ceiling supplied, so it can be swept over a
+/// corpus without editing the constant. Sweeping is the only honest way to move it: the
+/// gate was earned by real junk (see above), so a looser number has to be paid for in
+/// measured false accepts, not asserted.
+pub fn is_learnable_pair_at(
+    mishear: &str,
+    correct: &str,
+    max_distance: f32,
+) -> Option<&'static str> {
     let word_ok = |w: &str| {
         w.chars()
             .all(|c| c.is_alphabetic() || c == ' ')
@@ -590,7 +644,7 @@ pub fn is_learnable_pair(mishear: &str, correct: &str) -> Option<&'static str> {
         return Some("an ordinary English word");
     }
     let d = norm_levenshtein(mishear, correct);
-    if d <= 0.0 || d > 0.6 {
+    if d <= 0.0 || d > max_distance {
         return Some("not phonetically close enough to look like a mishear");
     }
     if is_truncation_of(correct, mishear) {
