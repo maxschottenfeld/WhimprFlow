@@ -55,19 +55,19 @@ impl Drop for LocalWorker {
     }
 }
 
-/// Platform application-support dir: `~/Library/Application Support/WhimprFlow Dev`
+/// Platform application-support dir: `~/Library/Application Support/WhimprFlow`
 /// on macOS, `%APPDATA%\WhimprFlow Dev` on Windows. Deliberately separate from the
 /// stable app's dir — see `hotkey.rs::support_dir` and project.md, Phase 0.
 fn app_support_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var("APPDATA").unwrap_or_default();
-        PathBuf::from(base).join("WhimprFlow Dev")
+        PathBuf::from(base).join("WhimprFlow")
     }
     #[cfg(not(target_os = "windows"))]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join("Library/Application Support/WhimprFlow Dev")
+        PathBuf::from(home).join("Library/Application Support/WhimprFlow")
     }
 }
 
