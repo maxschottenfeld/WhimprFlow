@@ -126,6 +126,17 @@ mod imp {
     static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static ANTHROPIC: OnceLock<Mutex<Option<whimpr_cleanup::AnthropicProvider>>> = OnceLock::new();
     static LOCAL: OnceLock<Mutex<Option<crate::local_llm::LocalWorker>>> = OnceLock::new();
+    /// The math stage's own worker, holding its own (larger) model. Separate from
+    /// `LOCAL` because the two stages deliberately run different models — the 4B
+    /// is much better at notation and much slower, which is the right trade behind
+    /// a deliberate hotkey and the wrong one on ordinary dictation.
+    ///
+    /// Spawned **lazily**, on the first math key-down, so the ~2.4 GB model is
+    /// never resident for someone who does not use the gesture. `MATH_SPAWNING`
+    /// guards against a second key-press starting a second process while the first
+    /// is still loading.
+    static MATH_LOCAL: OnceLock<Mutex<Option<crate::local_llm::LocalWorker>>> = OnceLock::new();
+    static MATH_SPAWNING: AtomicBool = AtomicBool::new(false);
     static SETTINGS: OnceLock<Mutex<whimpr_core::Settings>> = OnceLock::new();
     static DICTIONARY: OnceLock<Mutex<whimpr_core::DictionaryStore>> = OnceLock::new();
     static STATS: OnceLock<Mutex<whimpr_core::StatsStore>> = OnceLock::new();
@@ -712,6 +723,35 @@ mod imp {
         (text, fired)
     }
 
+    /// Spawn the math worker if it is not already up, on a background thread.
+    ///
+    /// Called from the key-down path, which runs on the CGEventTap callback — that
+    /// thread must return promptly or macOS disables the tap (and the hotkey dies
+    /// until relaunch). Loading a 2.4 GB model there would be several seconds of
+    /// exactly the stall that guard exists to prevent.
+    ///
+    /// Idempotent and safe to call on every math key-press: `MATH_SPAWNING` stops
+    /// a second press from starting a second process while the first is loading,
+    /// and the slot check stops it from replacing a live worker.
+    fn ensure_math_worker() {
+        let slot = MATH_LOCAL.get_or_init(|| Mutex::new(None));
+        if slot.lock().unwrap().is_some() {
+            return;
+        }
+        // `swap` rather than a check-then-set: two key-presses in quick succession
+        // would otherwise both see "not spawning" and both spawn.
+        if MATH_SPAWNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(|| {
+            eprintln!("[whimpr] math worker: loading (first use — this takes a few seconds)");
+            let w = crate::local_llm::spawn_math();
+            let slot = MATH_LOCAL.get_or_init(|| Mutex::new(None));
+            *slot.lock().unwrap() = w;
+            MATH_SPAWNING.store(false, Ordering::SeqCst);
+        });
+    }
+
     /// Convert a spoken-mathematics transcript into notation (G2: "'f of g' turns
     /// into `f(g)`"). Returns `(text, fired)`; on any failure the raw transcript
     /// comes back unchanged, because a dictation that is merely un-notated is
@@ -735,14 +775,28 @@ mod imp {
         eprintln!(
             "[whimpr] MATH MODE: format={format:?} app={} model={}",
             app_bundle_id.as_deref().unwrap_or("<unknown>"),
-            crate::local_llm::model_path()
+            crate::local_llm::math_model_path()
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_default()
         );
         let raw_out = whimpr_core::cleanup::post_process(raw);
         let messages = whimpr_core::mathfmt::build_messages(raw, format);
-        let result = LOCAL
+        // On the very first math dictation the worker is still loading — it was
+        // started at key-down, which usually covers it, but a two-second utterance
+        // can finish first. Wait rather than fall back to raw: the user asked for
+        // notation and silently not converting is the one outcome that looks like
+        // the feature is broken. Bounded so a worker that will never come up
+        // cannot hang the paste forever.
+        if MATH_SPAWNING.load(Ordering::SeqCst) {
+            eprintln!("[whimpr] math worker still loading — waiting");
+            let t = Instant::now();
+            while MATH_SPAWNING.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("[whimpr] math worker wait: {} ms", t.elapsed().as_millis());
+        }
+        let result = MATH_LOCAL
             .get()
             .and_then(|m| m.lock().unwrap().as_mut().map(|w| w.request(&messages, 400)));
         match result {
@@ -1094,6 +1148,15 @@ mod imp {
                     // be holding seconds later.
                     let math = (flags & FLAG_MATH_MODIFIER) != 0;
                     MATH_MODE.store(math, Ordering::SeqCst);
+                    if math {
+                        // Start loading the math model NOW rather than at
+                        // finalize. The user is about to speak for several
+                        // seconds, and the load overlaps with that instead of
+                        // being added to the wait after they stop. Off the tap
+                        // thread: the keyboard callback must never block, or
+                        // macOS disables the tap out from under us.
+                        ensure_math_worker();
+                    }
                     eprintln!(
                         "[whimpr] Right Option DOWN{}",
                         if math { " + Shift — MATH MODE" } else { "" }
