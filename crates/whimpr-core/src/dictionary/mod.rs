@@ -77,6 +77,31 @@ impl DictionaryStore {
         }
     }
 
+    /// Promote an auto-learned entry to an approved one, so it may rewrite text.
+    /// Returns true if an entry was found and changed.
+    ///
+    /// Approval is deliberately modelled as `source: Auto -> Manual` rather than a
+    /// separate `approved` flag: an approved suggestion is indistinguishable from a
+    /// word the user typed in by hand, both in what it is allowed to do and in how
+    /// the Hub should present it, and a second boolean would let the two disagree.
+    /// It also means the on-disk format does not change and no migration is needed.
+    ///
+    /// Idempotent — approving an already-manual entry reports false (nothing to do)
+    /// rather than being an error.
+    pub fn approve(&mut self, correct: &str) -> bool {
+        match self
+            .entries
+            .iter_mut()
+            .find(|e| e.correct.eq_ignore_ascii_case(correct))
+        {
+            Some(e) if e.source == DictSource::Auto => {
+                e.source = DictSource::Manual;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Remove an entry by its spelling (case-insensitive). Returns true if removed.
     pub fn remove(&mut self, correct: &str) -> bool {
         let before = self.entries.len();
@@ -221,6 +246,33 @@ impl DictionaryStore {
     fn replacement_rules(&self) -> Vec<(Vec<char>, &str)> {
         let mut rules: Vec<(Vec<char>, &str)> = Vec::new();
         for e in &self.entries {
+            // 🔴 Only APPROVED entries may rewrite text. An auto-learned entry is a
+            // *suggestion*: it still reaches `asr_prompt()` and biases whisper's
+            // decoding, but it does not get to edit what lands in Max's document
+            // until he approves it (which flips `source` to `Manual`).
+            //
+            // This is the split Wispr Flow ships — its auto-learned entries carry
+            // `replacement = NULL` and are vocabulary bias only, never a
+            // find-and-replace rule (verified against Max's own `flow.sqlite`:
+            // all 6 `user_edits` rows, `replacement` NULL). The reason matters,
+            // because auto-learn infers from a single observation and has produced
+            // junk three times — `nurmsl` 08-06, `clad` 08-15, `Hypothesis ->
+            // Hypothe` 08-16 — each caught by Max or by luck, never by the system.
+            // Wispr's own auto-learn is no better (2 of its 6 entries are typos);
+            // it is harmless there *only* because those entries cannot rewrite.
+            //
+            // ⚠️ Bias alone is NOT a substitute for this stage, which is why the
+            // approve step exists rather than dropping rewriting altogether.
+            // Measured on the harness 2026-08-17 over `fixtures/propernouns.wav`:
+            // the glossary fixed `WimpherFlow -> Whimprflow`, `Schachenfeld ->
+            // Thornbury` and `Celero -> Silero`, but left `Tauri` as "entry",
+            // and it *introduced* `Whisper -> WISPR`, a word that was correct
+            // without the prompt and is not in the glossary at all. Bias is
+            // probabilistic and has collateral effects on neighbours; only this
+            // function is a guarantee.
+            if e.source != DictSource::Manual {
+                continue;
+            }
             let correct = e.correct.trim();
             if correct.is_empty() {
                 continue;
@@ -491,5 +543,64 @@ mod tests {
         let e = s.entries.iter().find(|e| e.correct == "Manvi").unwrap();
         assert!(e.mishears.iter().any(|m| m == "Manvie"));
         assert_eq!(s.entries.iter().filter(|e| e.correct.eq_ignore_ascii_case("manvi")).count(), 1);
+    }
+
+    /// 🔴 The load-bearing half of the split: an unreviewed auto-learned entry must
+    /// never edit the user's text. This is the guard against §8.13 — auto-learn
+    /// infers from a single observation and has produced junk three times, and
+    /// `apply()` runs on every dictation.
+    #[test]
+    fn an_auto_entry_never_rewrites_text() {
+        let mut s = DictionaryStore::default();
+        s.add("Whimprflow", vec!["Wimperslow".into()], DictSource::Auto);
+        let (out, n) = s.apply("i use Wimperslow daily");
+        assert_eq!(out, "i use Wimperslow daily", "an unapproved entry rewrote text");
+        assert_eq!(n, 0);
+    }
+
+    /// …and the other half: it is a *suggestion*, not a no-op. It still reaches
+    /// whisper as decoding bias, which is exactly Wispr Flow's `replacement = NULL`
+    /// design. Losing this would make auto-learn worthless rather than cautious.
+    #[test]
+    fn an_auto_entry_still_biases_recognition() {
+        let mut s = DictionaryStore::default();
+        s.add("Whimprflow", vec!["Wimperslow".into()], DictSource::Auto);
+        let p = s.asr_prompt().expect("an auto entry must still reach the ASR prompt");
+        assert!(p.contains("Whimprflow"), "{p}");
+    }
+
+    #[test]
+    fn approving_an_auto_entry_grants_it_rewrite_authority() {
+        let mut s = DictionaryStore::default();
+        s.add("Whimprflow", vec!["Wimperslow".into()], DictSource::Auto);
+        assert!(s.approve("Whimprflow"));
+        let (out, n) = s.apply("i use Wimperslow daily");
+        assert_eq!(out, "i use Whimprflow daily");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn approve_matches_case_insensitively_and_is_idempotent() {
+        let mut s = DictionaryStore::default();
+        s.add("Whimprflow", vec!["Wimperslow".into()], DictSource::Auto);
+        // Case-insensitive, like `add` and `remove`.
+        assert!(s.approve("whimprflow"));
+        // Already manual — nothing left to do, and not an error.
+        assert!(!s.approve("Whimprflow"));
+        assert!(!s.approve("NeverHeardOfIt"));
+    }
+
+    /// Approval must not disturb the entry's data — only its authority. A rename or
+    /// a dropped mishear here would silently change what `apply()` matches.
+    #[test]
+    fn approve_changes_only_the_source() {
+        let mut s = DictionaryStore::default();
+        s.add("Whimprflow", vec!["Wimperslow".into(), "Wimpher Flow".into()], DictSource::Auto);
+        let before = s.entries[0].clone();
+        assert!(s.approve("Whimprflow"));
+        let after = &s.entries[0];
+        assert_eq!(after.correct, before.correct);
+        assert_eq!(after.mishears, before.mishears);
+        assert_eq!(after.source, DictSource::Manual);
     }
 }

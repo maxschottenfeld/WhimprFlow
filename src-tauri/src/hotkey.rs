@@ -447,6 +447,18 @@ mod imp {
         }
     }
 
+    /// Approve an auto-learned entry, granting it authority to rewrite text, and
+    /// persist. Until this is called the entry only biases whisper's decoding —
+    /// see `DictionaryStore::replacement_rules`.
+    pub fn dictionary_approve(correct: &str) {
+        if let Some(m) = DICTIONARY.get() {
+            let mut store = m.lock().unwrap();
+            if store.approve(correct) {
+                let _ = store.save(&dict_path());
+            }
+        }
+    }
+
     /// Remove a dictionary entry by spelling and persist.
     pub fn dictionary_remove(correct: &str) {
         if let Some(m) = DICTIONARY.get() {
@@ -1144,14 +1156,16 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
+    current_settings, dictionary_add, dictionary_approve, dictionary_entries, dictionary_learn,
+    dictionary_remove,
     history, init_logging, install, rebuild_providers, stats_summary, update_settings,
 };
 
 // Windows uses the real (but unverified) platform layer in `crate::win`.
 #[cfg(target_os = "windows")]
 pub use crate::win::{
-    current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
+    current_settings, dictionary_add, dictionary_approve, dictionary_entries, dictionary_learn,
+    dictionary_remove,
     history, init_logging, install, rebuild_providers, stats_summary, update_settings,
 };
 
@@ -1175,11 +1189,13 @@ mod other {
     }
     pub fn dictionary_add(_correct: String, _mishears: Vec<String>) {}
     pub fn dictionary_remove(_correct: &str) {}
+    pub fn dictionary_approve(_correct: &str) {}
     pub fn dictionary_learn(_correct: String, _mishears: Vec<String>) {}
     pub fn init_logging() {}
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::{
-    current_settings, dictionary_add, dictionary_entries, dictionary_learn, dictionary_remove,
+    current_settings, dictionary_add, dictionary_approve, dictionary_entries, dictionary_learn,
+    dictionary_remove,
     history, init_logging, install, rebuild_providers, stats_summary, update_settings,
 };

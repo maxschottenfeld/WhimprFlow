@@ -13,6 +13,7 @@
 mod imp {
     use std::os::raw::{c_char, c_void};
     use std::ptr;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::time::Duration;
 
     type CFTypeRef = *const c_void;
@@ -138,9 +139,156 @@ mod imp {
     struct SendPtr(AXUIElementRef);
     unsafe impl Send for SendPtr {}
 
+    /// Why an observation window closed. Mirrors Wispr Flow's
+    /// `contentObservationEndReason`, and the distinction is the whole point of this
+    /// module's 2026-08-17 rewrite.
+    ///
+    /// Measured over Max's own 1,175 Wispr dictations, restricted to rows carrying a
+    /// real edit (n ≈ 692):
+    ///
+    /// | terminator | rows |
+    /// |---|---|
+    /// | user pressed Return | 258 |
+    /// | next dictation started | 147 |
+    /// | textbox emptied | 22 |
+    /// | **observation window elapsed (timeout)** | **18** |
+    ///
+    /// WhimprFlow used to implement *only* the last row — a fixed 20 s ladder with
+    /// no early exit — i.e. the ~2.6% path. Both of Max's own successful Wispr
+    /// captures came through `next_dictation_started`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum EndReason {
+        /// The user started dictating again. They are done with the old field.
+        NextDictationStarted,
+        /// The field went empty under us — overwhelmingly "the user hit send".
+        TextboxEmptied,
+        /// The full poll ladder ran out.
+        WindowElapsed,
+        /// The element stopped answering (focus moved, or the app re-rendered).
+        ElementWentStale,
+    }
+
+    impl EndReason {
+        /// Does this terminator prove the user *finished editing*?
+        ///
+        /// This is load-bearing, because it decides how much evidence is needed
+        /// before writing to the dictionary. The in-window path requires a candidate
+        /// to survive two consecutive polls — that rule exists because a read taken
+        /// mid-keystroke looks exactly like a finished correction, and on 2026-08-16
+        /// one wrote `"Hypothesis" -> "Hypothe"` from a single observation.
+        ///
+        /// A semantic terminator supplies that same assurance by a different route:
+        /// if the user has moved on to another dictation, or sent the message, the
+        /// text they left behind **is** the finished state. Waiting for it to "hold"
+        /// is meaningless once nothing can change it again. A timeout proves nothing
+        /// of the kind — the user may be mid-word — so it keeps the stricter rule.
+        fn is_settled(self) -> bool {
+            matches!(self, Self::NextDictationStarted | Self::TextboxEmptied)
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::NextDictationStarted => "next_dictation_started",
+                Self::TextboxEmptied => "textbox_emptied",
+                Self::WindowElapsed => "observation_window_elapsed",
+                Self::ElementWentStale => "element_went_stale",
+            }
+        }
+    }
+
+    /// Handle to a running observation, so a later dictation can close it.
+    ///
+    /// The poll loop sleeps on the condvar rather than on `thread::sleep`, so ending
+    /// a watch wakes it **immediately** instead of up to 3 s later (the widest gap in
+    /// the ladder). That matters: the whole value of the `next_dictation_started`
+    /// terminator is evaluating the field state *promptly* once it is final.
+    pub(super) struct WatchHandle {
+        ended: Mutex<Option<EndReason>>,
+        wake: Condvar,
+    }
+
+    impl WatchHandle {
+        fn new() -> Self {
+            Self {
+                ended: Mutex::new(None),
+                wake: Condvar::new(),
+            }
+        }
+
+        /// Record the terminator and wake the poll loop. First writer wins — a
+        /// window that already closed for its own reason keeps that reason.
+        fn end(&self, reason: EndReason) {
+            let mut g = self.ended.lock().unwrap();
+            if g.is_none() {
+                *g = Some(reason);
+            }
+            self.wake.notify_all();
+        }
+
+        fn reason(&self) -> Option<EndReason> {
+            *self.ended.lock().unwrap()
+        }
+
+        /// Sleep for `gap`, waking early if the watch is ended. Returns the
+        /// terminator if one fired.
+        fn sleep_or_end(&self, gap: Duration) -> Option<EndReason> {
+            let g = self.ended.lock().unwrap();
+            if let Some(r) = *g {
+                return Some(r);
+            }
+            let (g, _timeout) = self.wake.wait_timeout(g, gap).unwrap();
+            *g
+        }
+    }
+
+    /// The one in-flight observation, if any.
+    ///
+    /// Deliberately at most one. Before this existed every dictation spawned a
+    /// detached thread that ran the full 20 s regardless, so a burst of dictations
+    /// left several watchers polling stale handles at once, each able to write to
+    /// the dictionary. Now a new dictation closes the old window first, which both
+    /// bounds the thread count at one and supplies the highest-value terminator.
+    static ACTIVE: OnceLock<Mutex<Option<Arc<WatchHandle>>>> = OnceLock::new();
+
+    fn active() -> &'static Mutex<Option<Arc<WatchHandle>>> {
+        ACTIVE.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Close the outstanding observation, if there is one, and let its thread do the
+    /// final evaluation. Called at the top of every dictation.
+    fn end_active_watch(reason: EndReason) {
+        // Release the registry lock *before* touching the handle's own lock. The
+        // nesting would be harmless today (the poll thread never grabs the registry
+        // while holding `ended`), but the two locks are reached from three call
+        // sites and an ordering rule nobody can see is a deadlock waiting for a
+        // fourth.
+        let h = active().lock().unwrap().take();
+        if let Some(h) = h {
+            h.end(reason);
+        }
+    }
+
+    /// Drop this watch from the registry once its thread is finished, unless a newer
+    /// dictation already replaced it. Without the identity check, a watch that ended
+    /// on the timeout would clear whichever watch happened to be running by then.
+    fn clear_active_if(handle: &Arc<WatchHandle>) {
+        let mut slot = active().lock().unwrap();
+        if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, handle)) {
+            *slot = None;
+        }
+    }
+
     /// Right after paste, snapshot the focused field, then check it once after a
     /// short delay for a one-word correction to learn.
     pub fn watch_correction(inserted: &str) {
+        // 🔴 FIRST, before any early return: a new dictation has started, so the
+        // previous observation window is over no matter what happens next. This is
+        // the highest-value terminator in the measured distribution (147 of ~692
+        // real-edit captures in Wispr's own telemetry, and both of Max's successful
+        // captures), and it must fire even when *this* dictation is not watchable —
+        // an untrusted process or a two-word utterance still means the user moved on.
+        end_active_watch(EndReason::NextDictationStarted);
+
         // Reads require Accessibility; also skip trivial dictations.
         if !crate::paste::is_trusted() || crate::autolearn::word_tokens(inserted).len() < 2 {
             return;
@@ -162,6 +310,8 @@ mod imp {
             return;
         }
         let holder = SendPtr(focused);
+        let handle = Arc::new(WatchHandle::new());
+        *active().lock().unwrap() = Some(Arc::clone(&handle));
         std::thread::spawn(move || {
             // Force whole-struct capture (2021 disjoint captures would otherwise grab
             // the raw pointer field and lose the `Send` impl on `SendPtr`).
@@ -171,11 +321,16 @@ mod imp {
             let mut consecutive_failures = 0usize;
             let mut learned = false;
 
-            // Diagnostic state only — never consulted by the decision path below.
-            // "N read(s), no clean one-word correction found" was logged 93 times out
-            // of 95 sessions between 08-09 and 08-16 and never once said which gate
-            // did the rejecting, so every "auto-learn doesn't work" report had to be
-            // answered by guessing. These three track the shape of what was seen.
+            // What the window saw. Added as diagnostics — "N read(s), no clean
+            // one-word correction found" was logged 93 times out of 95 sessions
+            // between 08-09 and 08-16 without ever saying which gate did the
+            // rejecting, so every "auto-learn doesn't work" report had to be answered
+            // by guessing.
+            //
+            // ⚠️ These are NO LONGER diagnostic-only (changed 2026-08-17). `best` and
+            // `last_text` are now the inputs to `finalize_observation` when the window
+            // closes on a semantic terminator. That is the entire point of the change:
+            // the reads were always being taken, and were being thrown away.
             let mut last_text: Option<String> = None;
             let mut empty_reads = 0usize;
             // The read that came CLOSEST to being a correction, i.e. the smallest
@@ -188,8 +343,17 @@ mod imp {
             // The correction seen on the previous poll, awaiting confirmation.
             let mut pending: Option<(String, String)> = None;
 
+            // How the window closed. Defaults to the timeout, and is overwritten the
+            // moment anything better happens.
+            let mut end_reason = EndReason::WindowElapsed;
+
             for (i, gap) in POLL_GAPS_MS.iter().enumerate() {
-                std::thread::sleep(Duration::from_millis(*gap));
+                // Interruptible sleep: a new dictation wakes this immediately rather
+                // than leaving the field unevaluated for up to 3 s.
+                if let Some(r) = handle.sleep_or_end(Duration::from_millis(*gap)) {
+                    end_reason = r;
+                    break;
+                }
                 match unsafe { element_value(holder.0) } {
                     Some(after) => {
                         reads_ok += 1;
@@ -212,7 +376,16 @@ mod imp {
                             // cause is the user sending the message. Worth counting
                             // separately: a correction made before the send is
                             // invisible by the time we look.
+                            //
+                            // This now TERMINATES the window instead of polling on.
+                            // Nothing further can be learned from a field the user
+                            // has already sent, and the state we want — what they
+                            // left just before sending — is already in `best` /
+                            // `last_text`. Continuing to poll only risked the handle
+                            // going stale before anything used those reads.
                             empty_reads += 1;
+                            end_reason = EndReason::TextboxEmptied;
+                            break;
                         } else {
                             last_text = Some(after.clone());
                             let score = nrem + nadd;
@@ -259,11 +432,73 @@ mod imp {
                     None => {
                         consecutive_failures += 1;
                         if consecutive_failures >= MAX_CONSECUTIVE_READ_FAILURES {
+                            end_reason = EndReason::ElementWentStale;
                             break;
                         }
                     }
                 }
             }
+
+            // A new dictation may have ended this watch while we were mid-poll rather
+            // than asleep, in which case the loop ran to the end of the ladder and
+            // still thinks it timed out. Pick that up — but only when nothing more
+            // specific already happened.
+            //
+            // The guard matters: without it, a window that ended because the element
+            // went stale (NOT a settled terminator) would be retroactively upgraded to
+            // `NextDictationStarted` (settled) by the next dictation, and the reads it
+            // is holding would be judged from a single observation. Whichever
+            // terminator actually fired first is the true one, and the local reasons
+            // are all set at the moment they occur.
+            if end_reason == EndReason::WindowElapsed {
+                if let Some(r) = handle.reason() {
+                    end_reason = r;
+                }
+            }
+
+            // ── Evaluate on termination ──────────────────────────────────────────
+            //
+            // Until 2026-08-17 `best` fed exactly one thing: the `WHY:` diagnostic
+            // printer. A correction that was seen, logged, and then wiped by the user
+            // pressing Return was thrown away — and "correct the word, then send" is
+            // the single most common real-world shape (258 of ~692 in Wispr's
+            // telemetry ended on a trailing newline, another 22 on the textbox
+            // emptying). The detector never got to look at it.
+            //
+            // ⚠️ Two properties of this block are deliberate and worth keeping:
+            //
+            //  1. It evaluates reads **already taken**; it never issues a fresh AX
+            //     read at termination. On `NextDictationStarted` the user has moved
+            //     on and the captured element may now resolve to a *different* field
+            //     — a stale `AXUIElement` does not error, it returns plausible
+            //     garbage. Judging only what we saw while the window was genuinely
+            //     open sidesteps that entirely.
+            //  2. It runs **only** for a settled terminator. On a timeout the user
+            //     may be mid-word, so the two-consecutive-poll rule still governs;
+            //     relaxing that is how `"Hypothesis" -> "Hypothe"` got written.
+            if !learned {
+                if let Some((mishear, correct)) = super::finalize_observation(
+                    &inserted,
+                    best.as_ref().map(|(_, t)| t.as_str()),
+                    last_text.as_deref(),
+                    end_reason.is_settled(),
+                ) {
+                    eprintln!(
+                        "[whimpr] ✨ auto-learned: \"{mishear}\" -> \"{correct}\" \
+                         (settled on {})",
+                        end_reason.label()
+                    );
+                    crate::hotkey::dictionary_learn(correct, vec![mishear]);
+                    learned = true;
+                }
+            }
+
+            eprintln!(
+                "[whimpr] auto-learn: observation ended — {} ({reads_ok} read(s), \
+                 learned={learned})",
+                end_reason.label()
+            );
+            clear_active_if(&handle);
             unsafe { CFRelease(holder.0) };
 
             // Say which of the two failure modes happened. Previously they were
@@ -536,6 +771,45 @@ pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)
     }
 }
 
+/// Decide what, if anything, to learn when an observation window closes.
+///
+/// Split out of the poll loop so the *policy* can be tested without an
+/// Accessibility handle, a focused text field, or a 20-second wait. The loop it
+/// came from is untestable by construction, which is how it went ten days without
+/// anyone noticing it was throwing away the reads it had already taken.
+///
+/// - `best` is the closest read seen (smallest non-zero word diff) — where a clean
+///   1-for-1 swap lands.
+/// - `last_text` is the last non-empty read — the state the user actually left.
+/// - `settled` says whether the terminator proves the user finished editing.
+///
+/// Both candidates are tried, in that order, because they disagree in a real case:
+/// a stray extra word elsewhere in the field can make some other read "closer" while
+/// the actual correction sits in the final one.
+///
+/// 🔴 **`settled` is not decoration.** A single observation is exactly what wrote
+/// `"Hypothesis" -> "Hypothe"` to the dictionary on 2026-08-16, caught mid-keystroke.
+/// The in-window path defends against that by requiring a candidate to survive two
+/// consecutive polls. This path may skip that rule *only* because a semantic
+/// terminator supplies the same assurance another way — once the user has moved to
+/// the next dictation or sent the message, the text cannot change again, so waiting
+/// for it to "hold" would prove nothing that has not already been proven. On a
+/// timeout none of that holds, and this returns `None`.
+pub fn finalize_observation(
+    inserted: &str,
+    best: Option<&str>,
+    last_text: Option<&str>,
+    settled: bool,
+) -> Option<(String, String)> {
+    if !settled {
+        return None;
+    }
+    [best, last_text]
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| detect_correction(inserted, candidate))
+}
+
 /// Is `candidate` a strict prefix of `original`, short by 2 or more characters?
 ///
 /// This is the mid-edit guard, and it exists because the phonetic gate cannot be it.
@@ -772,5 +1046,81 @@ mod tests {
         // The COMMON stoplist is what keeps ordinary typo fixes out.
         assert_eq!(detect_correction("i left there bag", "i left their bag"), None);
         assert_eq!(detect_correction("go form here now", "go from here now"), None);
+    }
+
+    // ── Observation lifetime (2026-08-17) ────────────────────────────────────
+    //
+    // These cover the change from "poll for a fixed 20 seconds and judge only what
+    // is visible at the moment of judging" to "stop when something semantic happens
+    // and judge what was actually seen".
+
+    /// The shape the old loop threw away, and the dominant real-world one: the user
+    /// corrects the word, then presses Return. The corrected text was read, scored,
+    /// logged — and then only ever handed to the `WHY:` printer.
+    #[test]
+    fn a_correction_then_send_is_now_learned() {
+        let inserted = "i use Wimperslow every day";
+        let corrected = "i use Whimprflow every day";
+        assert_eq!(
+            finalize_observation(inserted, Some(corrected), Some(corrected), true),
+            Some(("Wimperslow".to_string(), "Whimprflow".to_string()))
+        );
+    }
+
+    /// 🔴 The guard that keeps this from re-opening the `Hypothesis -> Hypothe` hole.
+    /// On a timeout we have no evidence the user stopped typing, so a single
+    /// observation is not enough no matter how clean it looks.
+    #[test]
+    fn an_unsettled_window_learns_nothing_even_from_a_perfect_read() {
+        let inserted = "i use Wimperslow every day";
+        let corrected = "i use Whimprflow every day";
+        // Identical inputs to the test above; only the terminator differs.
+        assert_eq!(
+            finalize_observation(inserted, Some(corrected), Some(corrected), false),
+            None
+        );
+    }
+
+    /// The two candidates genuinely disagree, which is why both are tried. Here an
+    /// unrelated word typed elsewhere makes the *closest* read useless while the
+    /// final read holds the real correction.
+    #[test]
+    fn it_falls_back_to_the_last_read_when_the_closest_one_is_not_a_swap() {
+        let inserted = "ping the server monvi";
+        // Closest read: one word added, nothing removed — not a 1-for-1 swap.
+        let best = "ping the server monvi now";
+        let last = "ping the server Manvi";
+        assert_eq!(detect_correction(inserted, best), None);
+        assert_eq!(
+            finalize_observation(inserted, Some(best), Some(last), true),
+            Some(("monvi".to_string(), "Manvi".to_string()))
+        );
+    }
+
+    /// A window that saw nothing usable stays silent rather than inventing a pair.
+    #[test]
+    fn nothing_observed_learns_nothing() {
+        assert_eq!(finalize_observation("some dictated words", None, None, true), None);
+    }
+
+    /// Termination must not weaken any accept gate — it changes *when* the detector
+    /// is consulted, never *what* it accepts. A common-word edit is still refused on
+    /// the settled path.
+    #[test]
+    fn a_settled_terminator_does_not_relax_the_gates() {
+        assert_eq!(
+            finalize_observation("i left there bag", Some("i left their bag"), None, true),
+            None
+        );
+        assert_eq!(
+            finalize_observation(
+                "look at the Riemann Hypothesis",
+                Some("look at the Riemann Hypothe"),
+                None,
+                true
+            ),
+            None,
+            "a truncation must stay rejected even when the window closed cleanly"
+        );
     }
 }

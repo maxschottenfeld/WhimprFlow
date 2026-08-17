@@ -161,6 +161,15 @@ fn remove_dictionary_entry(correct: String) {
     hotkey::dictionary_remove(&correct);
 }
 
+/// Approve an auto-learned (✨) entry, letting it correct text from now on.
+///
+/// Until this is called the entry is a *suggestion*: it biases what whisper hears
+/// but never edits what gets pasted. See `DictionaryStore::replacement_rules`.
+#[tauri::command]
+fn approve_dictionary_entry(correct: String) {
+    hotkey::dictionary_approve(&correct);
+}
+
 /// Permission + capability status shown in the Hub.
 #[derive(Clone, Serialize)]
 struct StatusReport {
@@ -274,6 +283,7 @@ pub fn run() {
             get_dictionary,
             add_dictionary_entry,
             remove_dictionary_entry,
+            approve_dictionary_entry,
             get_status,
             request_microphone,
             request_accessibility,

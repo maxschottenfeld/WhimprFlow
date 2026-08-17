@@ -182,3 +182,19 @@ export async function removeDictionaryEntry(correct: string): Promise<void> {
   }
 }
 
+/**
+ * Approve an auto-learned (✨) entry, letting it correct text from now on.
+ *
+ * Until this is called the entry only biases what Whisper hears — it never edits
+ * what gets pasted. That split is deliberate: auto-learn infers an entry from a
+ * single observed correction and has guessed wrong before, and the correction
+ * stage runs on every dictation.
+ */
+export async function approveDictionaryEntry(correct: string): Promise<void> {
+  try {
+    await invoke<void>("approve_dictionary_entry", { correct });
+  } catch {
+    /* browser preview — no-op */
+  }
+}
+

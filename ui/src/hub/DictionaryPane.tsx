@@ -5,6 +5,7 @@ import { Button, Card } from "./ui";
 import { Icon } from "./icons";
 import {
   addDictionaryEntry,
+  approveDictionaryEntry,
   getDictionary,
   removeDictionaryEntry,
   type DictEntry,
@@ -118,7 +119,15 @@ function AddForm({ onDone }: { onDone: () => void }) {
   );
 }
 
-function EntryRow({ entry, onRemove }: { entry: DictEntry; onRemove: () => void }) {
+function EntryRow({
+  entry,
+  onRemove,
+  onApprove,
+}: {
+  entry: DictEntry;
+  onRemove: () => void;
+  onApprove: () => void;
+}) {
   const [hover, setHover] = useState(false);
   return (
     <div
@@ -136,7 +145,7 @@ function EntryRow({ entry, onRemove }: { entry: DictEntry; onRemove: () => void 
       <div style={{ minWidth: 0 }}>
         <span style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>{entry.correct}</span>
         {entry.auto && (
-          <span title="Auto-learned" style={{ marginLeft: 6, fontSize: 13 }}>
+          <span title="Auto-learned — suggestion only until you approve it" style={{ marginLeft: 6, fontSize: 13 }}>
             ✨
           </span>
         )}
@@ -145,24 +154,42 @@ function EntryRow({ entry, onRemove }: { entry: DictEntry; onRemove: () => void 
             → heard as {entry.mishears.join(", ")}
           </span>
         )}
+        {/* An unapproved entry is not yet doing the thing the user expects a
+            dictionary entry to do, so say so plainly rather than leaving ✨ to
+            carry the meaning on its own. */}
+        {entry.auto && (
+          <div style={{ marginTop: 3, fontSize: 12, color: theme.textFaint }}>
+            Suggestion — nudges what WhimprFlow hears, but won’t correct your text yet.
+          </div>
+        )}
       </div>
-      <button
-        onClick={onRemove}
-        title="Remove"
-        style={{
-          border: "none",
-          background: "transparent",
-          cursor: "pointer",
-          color: theme.textFaint,
-          opacity: hover ? 1 : 0,
-          transition: "opacity 120ms ease",
-          display: "flex",
-          alignItems: "center",
-          padding: 4,
-        }}
-      >
-        <Icon name="close" size={16} />
-      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+        {/* Always visible, not hover-revealed: the whole design depends on this
+            being noticed and used. A hidden approve button is a suggestion queue
+            that quietly never gets read. */}
+        {entry.auto && (
+          <Button size="sm" variant="ghost" onClick={onApprove}>
+            Approve
+          </Button>
+        )}
+        <button
+          onClick={onRemove}
+          title="Remove"
+          style={{
+            border: "none",
+            background: "transparent",
+            cursor: "pointer",
+            color: theme.textFaint,
+            opacity: hover ? 1 : 0,
+            transition: "opacity 120ms ease",
+            display: "flex",
+            alignItems: "center",
+            padding: 4,
+          }}
+        >
+          <Icon name="close" size={16} />
+        </button>
+      </div>
     </div>
   );
 }
@@ -180,6 +207,11 @@ export function DictionaryPane() {
 
   const remove = async (correct: string) => {
     await removeDictionaryEntry(correct);
+    await load();
+  };
+
+  const approve = async (correct: string) => {
+    await approveDictionaryEntry(correct);
     await load();
   };
 
@@ -289,7 +321,12 @@ export function DictionaryPane() {
           ) : (
             <div style={{ padding: "4px 14px" }}>
               {filtered.map((e) => (
-                <EntryRow key={e.correct} entry={e} onRemove={() => void remove(e.correct)} />
+                <EntryRow
+                  key={e.correct}
+                  entry={e}
+                  onRemove={() => void remove(e.correct)}
+                  onApprove={() => void approve(e.correct)}
+                />
               ))}
             </div>
           )}

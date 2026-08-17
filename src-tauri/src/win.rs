@@ -424,6 +424,17 @@ pub fn dictionary_remove(correct: &str) {
     }
 }
 
+/// Approve an auto-learned entry so it may rewrite text (see the macOS twin in
+/// `hotkey.rs` and `DictionaryStore::replacement_rules`).
+pub fn dictionary_approve(correct: &str) {
+    if let Some(m) = DICTIONARY.get() {
+        let mut store = m.lock().unwrap();
+        if store.approve(correct) {
+            let _ = store.save(&dict_path());
+        }
+    }
+}
+
 pub fn dictionary_learn(correct: String, mishears: Vec<String>) {
     if let Some(m) = DICTIONARY.get() {
         let mut store = m.lock().unwrap();
