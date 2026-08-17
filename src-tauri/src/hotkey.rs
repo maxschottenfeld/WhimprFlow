@@ -91,6 +91,20 @@ mod imp {
     const FLAG_HOTKEY_MODIFIER: u64 = 0x0008_0000; // kCGEventFlagMaskAlternate (Option)
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
     const KEYCODE_HOTKEY: i64 = 61; // kVK_RightOption
+    /// Hold Shift while pressing the dictation hotkey to dictate MATHEMATICS —
+    /// the transcript is converted to notation instead of being cleaned up (G2).
+    ///
+    /// A modifier on the existing key rather than a second global hotkey, for
+    /// three reasons. It needs no new keycode, so it cannot collide with a key
+    /// the user has bound elsewhere. It needs no change to
+    /// `promote-to-stable.sh`'s de-brand — that script rewrites `KEYCODE_HOTKEY`
+    /// from Right Option to Fn, and a Shift modifier rides along with whichever
+    /// key that is, so stable and dev keep their separate bindings for free
+    /// (a shared second keycode would have had BOTH apps firing at once, since
+    /// they are designed to run side by side). And the gesture composes: the
+    /// modifier is read at key-DOWN from the event's own flags, which already
+    /// carry the full modifier state, so Shift simply has to be held first.
+    const FLAG_MATH_MODIFIER: u64 = 0x0002_0000; // kCGEventFlagMaskShift
     const K_CG_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
     const K_CG_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
@@ -100,8 +114,13 @@ mod imp {
     static FN_IS_DOWN: AtomicBool = AtomicBool::new(false);
     static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
     /// Bundle id of the app that was frontmost at record-start = the paste target.
-    /// Cleanup uses it to format for the medium (email vs. text vs. chat).
+    /// Cleanup uses it to format for the medium (email vs. text vs. chat); the
+    /// math stage uses it to pick Unicode or LaTeX.
     static TARGET_APP: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    /// Whether the dictation now being recorded was started with Shift held, i.e.
+    /// is a MATH dictation. Latched at key-DOWN and read at finalize, because the
+    /// user has long since let go of Shift by the time the transcript exists.
+    static MATH_MODE: AtomicBool = AtomicBool::new(false);
     static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
     static ASR: OnceLock<Arc<whimpr_asr::WhisperEngine>> = OnceLock::new();
     static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
@@ -147,6 +166,12 @@ mod imp {
         asr_ms: u64,
         cleanup_fired: bool,
         cleanup_ms: u64,
+        /// True when this dictation was started with Shift held, so `cleanup_ms`
+        /// is the MATH stage's time rather than cleanup's. Without this flag the
+        /// two are indistinguishable in the metrics, and they have very different
+        /// latency profiles — which would quietly corrupt any latency baseline
+        /// computed from a day's log.
+        math_mode: bool,
         /// Deterministic dictionary replacements applied on the hot lane.
         dict_hits: usize,
         /// Microseconds, not milliseconds — the stage is expected to round to 0ms and
@@ -687,6 +712,69 @@ mod imp {
         (text, fired)
     }
 
+    /// Convert a spoken-mathematics transcript into notation (G2: "'f of g' turns
+    /// into `f(g)`"). Returns `(text, fired)`; on any failure the raw transcript
+    /// comes back unchanged, because a dictation that is merely un-notated is
+    /// still the user's words, and one that is empty is not.
+    ///
+    /// Runs INSTEAD of cleanup, not after it. Two LLM calls on one dictation
+    /// would double the wait for no benefit: `needs_cleanup()` is false on all
+    /// ten math fixtures (measured by running it, not by reading it), so on real
+    /// math dictation cleanup almost never fires anyway — and where it did, the
+    /// two prompts would be arguing over the same text.
+    ///
+    /// Notation is chosen from the paste target: Unicode by default, LaTeX where
+    /// it is actually typeset. See `whimpr_core::mathfmt::format_for_app`.
+    fn format_math(raw: &str) -> (String, bool) {
+        let app_bundle_id = TARGET_APP.get().and_then(|m| m.lock().unwrap().clone());
+        let format = whimpr_core::mathfmt::format_for_app(app_bundle_id.as_deref());
+        // Log the model as well as the format. The 4B and the 1.5B differ enough
+        // in both accuracy and latency that "which one ran" is the first question
+        // to ask of a bad result — and the 4B arrives by a file RENAME in the
+        // models dir, which is otherwise an invisible change to this behaviour.
+        eprintln!(
+            "[whimpr] MATH MODE: format={format:?} app={} model={}",
+            app_bundle_id.as_deref().unwrap_or("<unknown>"),
+            crate::local_llm::model_path()
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+        );
+        let raw_out = whimpr_core::cleanup::post_process(raw);
+        let messages = whimpr_core::mathfmt::build_messages(raw, format);
+        let result = LOCAL
+            .get()
+            .and_then(|m| m.lock().unwrap().as_mut().map(|w| w.request(&messages, 400)));
+        match result {
+            Some(Ok(out)) => {
+                let out = whimpr_core::mathfmt::finalize(&out);
+                // The ONLY rejection here is empty output. Deliberately no
+                // length, retention, or similarity gate: a correct dense
+                // conversion is far shorter than its input (the Cauchy formula
+                // scores 0.26 retention and is perfect), so any such gate rejects
+                // good output and passes bad. That was built, measured and killed
+                // on 2026-08-17 — see whimpr_core::mathfmt's module header.
+                if out.is_empty() {
+                    eprintln!("[whimpr] math stage returned nothing — pasting raw");
+                    (raw_out, true)
+                } else {
+                    (out, true)
+                }
+            }
+            Some(Err(e)) => {
+                eprintln!("[whimpr] math stage failed ({e}) — pasting raw");
+                (raw_out, true)
+            }
+            None => {
+                eprintln!(
+                    "[whimpr] ⚠ MATH MODE requested but the local LLM worker is not running — \
+                     pasting the raw transcript. Nothing was converted."
+                );
+                (raw_out, false)
+            }
+        }
+    }
+
     fn now_ms() -> u64 {
         CLOCK.get().map(|c| c.elapsed().as_millis() as u64).unwrap_or(0)
     }
@@ -838,12 +926,23 @@ mod imp {
                             let ms_asr = t_asr.elapsed().as_millis();
                             let raw = t.text;
                             eprintln!("[whimpr] TRANSCRIPT: \"{}\"", raw);
-                            // Clean the transcript (cloud LLM if configured), then paste.
+                            // Either convert spoken mathematics to notation (the
+                            // Shift+hotkey gesture) or clean the transcript — not
+                            // both. See format_math() for why they are exclusive.
+                            let math_mode = MATH_MODE.load(Ordering::SeqCst);
                             let t_clean = Instant::now();
-                            let (text, cleanup_fired) = clean_transcript(&raw);
+                            let (text, cleanup_fired) = if math_mode {
+                                format_math(&raw)
+                            } else {
+                                clean_transcript(&raw)
+                            };
                             let ms_clean = t_clean.elapsed().as_millis();
                             if text != raw {
-                                eprintln!("[whimpr] CLEANED:   \"{}\"", text);
+                                eprintln!(
+                                    "[whimpr] {}: \"{}\"",
+                                    if math_mode { "MATH     " } else { "CLEANED  " },
+                                    text
+                                );
                             }
                             // Hot lane, deterministic stage. Placed *after* cleanup on
                             // purpose: cleanup is an LLM and can rewrite a word we just
@@ -909,6 +1008,7 @@ mod imp {
                                     asr_ms: ms_asr as u64,
                                     cleanup_fired,
                                     cleanup_ms: ms_clean as u64,
+                                    math_mode,
                                     dict_hits,
                                     dict_us: us_dict as u64,
                                     paste_ms: ms_paste as u64,
@@ -987,7 +1087,17 @@ mod imp {
                 let was_down = FN_IS_DOWN.swap(down, Ordering::SeqCst);
                 let at_ms = now_ms();
                 if down && !was_down {
-                    eprintln!("[whimpr] Right Option DOWN");
+                    // Latch math mode from the modifier state carried on THIS
+                    // event. It has to be read here and stored: by the time the
+                    // transcript exists the key is long released, and re-reading
+                    // the keyboard then would report whatever the user happens to
+                    // be holding seconds later.
+                    let math = (flags & FLAG_MATH_MODIFIER) != 0;
+                    MATH_MODE.store(math, Ordering::SeqCst);
+                    eprintln!(
+                        "[whimpr] Right Option DOWN{}",
+                        if math { " + Shift — MATH MODE" } else { "" }
+                    );
                     // Snapshot the paste target now, while the user's app is focused.
                     let target = crate::appctx::frontmost_bundle_id();
                     *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;

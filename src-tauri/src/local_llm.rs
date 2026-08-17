@@ -1,59 +1,16 @@
-//! Spawns and talks to the local-LLM cleanup worker (a separate process, so
-//! llama.cpp and whisper.cpp never link into the same binary). One JSON request
-//! per line over stdio: `{system,user}` -> `{text}`.
+//! Finds and spawns the local-LLM worker (a separate process, so llama.cpp and
+//! whisper.cpp never link into the same binary).
+//!
+//! The **protocol** — one JSON request per line over stdio — lives in
+//! `whimpr_core::worker` so the app and the offline harness share a single
+//! implementation and cannot drift apart. What stays here is the part that is
+//! genuinely app-specific: where the binary and the model live inside a bundle.
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::path::PathBuf;
 
-pub struct LocalWorker {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl LocalWorker {
-    pub fn spawn(worker_bin: &Path, model: &Path) -> anyhow::Result<Self> {
-        let mut child = Command::new(worker_bin)
-            .arg(model)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?);
-        Ok(Self { child, stdin, stdout })
-    }
-
-    /// Send one cleanup request (system prompt + few-shot turns + transcript) and
-    /// read the response (blocks until the line comes).
-    pub fn cleanup(
-        &mut self,
-        messages: &[whimpr_core::cleanup::CleanupMsg],
-    ) -> anyhow::Result<String> {
-        let req = serde_json::json!({ "messages": messages, "max_tokens": 400 });
-        let mut line = serde_json::to_string(&req)?;
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
-
-        let mut resp = String::new();
-        if self.stdout.read_line(&mut resp)? == 0 {
-            anyhow::bail!("local worker closed");
-        }
-        let v: serde_json::Value = serde_json::from_str(&resp)?;
-        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-            anyhow::bail!("local llm: {err}");
-        }
-        Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
-    }
-}
-
-impl Drop for LocalWorker {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-    }
-}
+/// Re-exported so existing call sites (`local_llm::LocalWorker`) keep reading the
+/// same. The type itself is `whimpr_core::worker::LocalWorker`.
+pub use whimpr_core::worker::LocalWorker;
 
 /// Platform application-support dir: `~/Library/Application Support/WhimprFlow Dev`
 /// on macOS, `%APPDATA%\WhimprFlow Dev` on Windows. Deliberately separate from the
@@ -132,9 +89,19 @@ pub fn worker_bin_path() -> Option<PathBuf> {
     }
 }
 
-/// The local cleanup model path (same models dir as whisper/ASR). Prefer the
-/// larger, much more capable Qwen3-4B if present (far better at
-/// self-corrections and structure than the 1.5B); fall back to the 1.5B otherwise.
+/// The local model path (same models dir as whisper/ASR). Prefer the larger,
+/// much more capable Qwen3-4B if present (far better at self-corrections and
+/// structure than the 1.5B); fall back to the 1.5B otherwise.
+///
+/// ⚠️ **One worker serves both cleanup and the math stage**, so this function
+/// decides the model for both — there is no separate math model. The 4B is
+/// currently parked in the models dir as `…q4_k_m.gguf.candidate`, which does not
+/// match the name below, so this resolves to the **1.5B** — which is what the
+/// math stage was chosen on (2026-08-17: 1.5B-Unicode at ~1.4 s median versus
+/// ~3.7 s for the 4B). Dropping the `.candidate` suffix therefore changes the
+/// math stage's model and latency as well as cleanup's. The math stage logs the
+/// resolved model filename on every run so a rename never changes behaviour
+/// silently.
 pub fn model_path() -> PathBuf {
     let dir = app_support_dir().join("models");
     for name in [
