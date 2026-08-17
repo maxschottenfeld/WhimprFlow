@@ -343,6 +343,19 @@ mod imp {
             // The correction seen on the previous poll, awaiting confirmation.
             let mut pending: Option<(String, String)> = None;
 
+            // What was already in the field, measured from the FIRST successful read.
+            //
+            // 🔴 This is what makes a correction inside a field that already had text
+            // detectable at all. The first poll lands ~1.2 s after the paste, before the
+            // user has edited anything, so it shows the paste sitting in whatever was
+            // there. Everything that changes after it is the user's doing.
+            //
+            // It must be MEASURED here rather than inferred later: prior text and text
+            // the user has just typed are both trailing insertions and a single snapshot
+            // cannot tell them apart. See `whimpr_core::editshape`.
+            let mut prior = super::PriorContext::default();
+            let mut baseline_taken = false;
+
             // How the window closed. Defaults to the timeout, and is overwritten the
             // moment anything better happens.
             let mut end_reason = EndReason::WindowElapsed;
@@ -387,6 +400,19 @@ mod imp {
                             end_reason = EndReason::TextboxEmptied;
                             break;
                         } else {
+                            if !baseline_taken {
+                                prior = super::PriorContext::from_baseline(&inserted, &after);
+                                baseline_taken = true;
+                                if !prior.before.is_empty() || !prior.after.is_empty() {
+                                    eprintln!(
+                                        "[whimpr] auto-learn: field already held {} word(s) \
+                                         before and {} after the paste — they will be \
+                                         ignored",
+                                        prior.before.len(),
+                                        prior.after.len()
+                                    );
+                                }
+                            }
                             last_text = Some(after.clone());
                             let score = nrem + nadd;
                             if score > 0 && best.as_ref().is_none_or(|(b, _)| score < *b) {
@@ -402,7 +428,7 @@ mod imp {
                         // observation — with `apply()` now live on the hot lane, that
                         // would have started silently rewriting the word in every
                         // dictation. One sample is not evidence that an edit is done.
-                        match super::detect_correction(&inserted, &after) {
+                        match super::detect_correction_in(&inserted, &after, &prior) {
                             Some(pair) if pending.as_ref() == Some(&pair) => {
                                 let (mishear, correct) = pair;
                                 eprintln!(
@@ -482,6 +508,7 @@ mod imp {
                     best.as_ref().map(|(_, t)| t.as_str()),
                     last_text.as_deref(),
                     end_reason.is_settled(),
+                    &prior,
                 ) {
                     eprintln!(
                         "[whimpr] ✨ auto-learned: \"{mishear}\" -> \"{correct}\" \
@@ -522,7 +549,7 @@ mod imp {
                         Some(after) => eprintln!(
                             "[whimpr] auto-learn: WHY: {} (closest read; empty reads: \
                              {empty_reads}/{reads_ok})",
-                            super::rejection_reason(&inserted, after)
+                            super::rejection_reason_in(&inserted, after, &prior)
                         ),
                         None => eprintln!(
                             "[whimpr] auto-learn: WHY: every read was an empty field \
@@ -541,6 +568,8 @@ pub use imp::watch_correction;
 
 #[cfg(not(target_os = "macos"))]
 pub fn watch_correction(_inserted: &str) {}
+
+use whimpr_core::editshape::PriorContext;
 
 /// Split into alphanumeric word tokens (punctuation stripped), original case kept.
 pub fn word_tokens(s: &str) -> Vec<String> {
@@ -610,76 +639,47 @@ fn word_diff(inserted: &str, after: &str) -> Option<(Vec<String>, Vec<String>)> 
 /// [`word_diff`], but the checks below are deliberately duplicated so that a change
 /// here can never change behaviour there.
 pub fn rejection_reason(inserted: &str, after: &str) -> String {
-    let Some((removed, added)) = word_diff(inserted, after) else {
+    rejection_reason_in(inserted, after, &PriorContext::default())
+}
+
+/// As [`rejection_reason`], with the prior context the watcher measured.
+pub fn rejection_reason_in(inserted: &str, after: &str, prior: &PriorContext) -> String {
+    use whimpr_core::editshape::{analyse_in_region, is_learnable_pair};
+
+    let v = analyse_in_region(inserted, after, prior);
+    if v.labels.is_empty() {
         return "one side had no words at all (field empty, or nothing pasted)".into();
-    };
-
-    if removed.is_empty() && added.is_empty() {
-        // No visible change at all. Worth its own message because one important case
-        // lands here rather than at any gate: `word_diff` compares lowercased words,
-        // so a CASE-ONLY correction cancels out and is invisible before any gate runs.
-        // `DictionaryStore::apply` explicitly supports case-only entries and names
-        // "Katex" -> "KaTeX" as its motivating example — but auto-learn can never
-        // produce one. (This is also why the `eq_ignore_ascii_case` check inside
-        // `detect_correction` is unreachable in practice: a pair that differs by case
-        // alone never survives the diff to reach it.)
-        return "no word-level difference between the pasted text and the field \
-                — note the diff is CASE-INSENSITIVE, so a case-only fix such as \
-                \"Katex\" -> \"KaTeX\" is invisible to auto-learn by construction"
-            .into();
     }
-
-    if removed.len() != 1 || added.len() != 1 {
-        return format!(
-            "not a 1-for-1 swap — {} word(s) removed {:?}, {} word(s) added {:?} \
-             (whole-field diff: text already in the field counts as added)",
-            removed.len(),
-            preview(&removed),
-            added.len(),
-            preview(&added),
-        );
+    match v.correction {
+        None => {
+            let subs = v.labels.matches('S').count();
+            let why = if v.labels.contains('E') {
+                "an edge substitution whose replacement is a prefix or suffix of what it \
+                 replaced — that is a read taken mid-keystroke, not a finished correction"
+            } else if subs == 0 {
+                "no word was substituted — only insertions, deletions or casing, which is \
+                 writing rather than correcting"
+            } else if subs > 1 {
+                "more than one word was substituted — too ambiguous to learn from"
+            } else {
+                "the substitution is not flanked by untouched words (something was inserted \
+                 or changed next to it), so it reads as continued writing rather than a fix"
+            };
+            format!("shape {} rejected: {why}", v.labels)
+        }
+        Some((mishear, correct)) => match is_learnable_pair(&mishear, &correct) {
+            Some(reason) => format!(
+                "shape {} accepted \"{mishear}\" -> \"{correct}\", but rejected on \
+                 vocabulary: {reason}",
+                v.labels
+            ),
+            None => format!(
+                "shape {} — \"{mishear}\" -> \"{correct}\": all gates passed \
+                 (unexpected — should have been learned)",
+                v.labels
+            ),
+        },
     }
-
-    let mishear = &removed[0];
-    let correct = &added[0];
-    let alpha = |w: &str| w.chars().all(|c| c.is_alphabetic());
-
-    if mishear.chars().count() < 3 || correct.chars().count() < 3 {
-        return format!("\"{mishear}\" -> \"{correct}\": rejected, a word is under 3 chars");
-    }
-    if !alpha(mishear) || !alpha(correct) {
-        return format!("\"{mishear}\" -> \"{correct}\": rejected, non-alphabetic");
-    }
-    if correct.eq_ignore_ascii_case(mishear) {
-        // Unreachable in practice — see the empty-diff branch above. Kept so the two
-        // gate sequences stay structurally aligned.
-        return format!("\"{mishear}\" -> \"{correct}\": rejected, differs by case only");
-    }
-    if is_common(correct) || is_common(mishear) {
-        return format!("\"{mishear}\" -> \"{correct}\": rejected, an ordinary English word");
-    }
-    let d = norm_levenshtein(mishear, correct);
-    if d <= 0.0 || d > 0.6 {
-        return format!(
-            "\"{mishear}\" -> \"{correct}\": rejected, normalized edit distance {d:.2} \
-             outside (0.0, 0.6] — not phonetically close enough to look like a mishear"
-        );
-    }
-    if is_truncation_of(correct, mishear) {
-        return format!(
-            "\"{mishear}\" -> \"{correct}\": rejected, \"{correct}\" is a TRUNCATION of \
-             \"{mishear}\" — almost certainly read while still being typed"
-        );
-    }
-    let titled = correct.chars().next().is_some_and(|c| c.is_uppercase());
-    if !titled && (mishear.chars().count() < 4 || correct.chars().count() < 4) {
-        return format!(
-            "\"{mishear}\" -> \"{correct}\": rejected, lowercase and under 4 chars \
-             (not distinctive enough)"
-        );
-    }
-
-    format!("\"{mishear}\" -> \"{correct}\": all gates passed (unexpected — should have been learned)")
 }
 
 /// First few words of a diff list, so a 200-word field does not fill the log.
@@ -712,63 +712,39 @@ pub fn preview_text(s: &str) -> String {
 /// Detect a single clean one-word correction: exactly one word removed from the
 /// inserted text and one word added in the field, both distinctive and phonetically
 /// close, with the new word looking like a proper noun. Returns `(mishear, correct)`.
+/// 🔴 **Superseded 2026-08-17 — this now delegates to [`whimpr_core::editshape`].**
+///
+/// The old implementation was a **set difference over the whole field**, accepted only
+/// on a clean 1-for-1 swap. Measured against 46 real edits from Max's own history,
+/// embedded in real prior text: it learned **0 of 46 — literally nothing.** Every word
+/// already in the target field counted as "added", so a correction inside a note with
+/// content, a chat with history, or a document could never be a 1-for-1 swap. Observed
+/// live the same evening: Max's `derelict → Dirichlet` fix was seen and held across
+/// seven polls and rejected as `-1 +12`.
+///
+/// The replacement aligns the token sequences, strips the prior context measured from the
+/// first read, and gates on edit **shape** — a substitution flanked by untouched tokens —
+/// then applies the same vocabulary-quality gates as before. Same corpus, same prior
+/// text: **6 of 46.**
+///
+/// Kept as a wrapper because the mid-poll path has no prior context to offer; prefer
+/// [`detect_correction_in`] wherever a baseline read is available, which in the watcher
+/// it always is.
 pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)> {
-    let (removed, added) = word_diff(inserted, after)?;
-    if removed.len() != 1 || added.len() != 1 {
-        return None; // only learn on a clean 1-for-1 swap
-    }
-    let mishear = removed[0].clone();
-    let correct = added[0].clone();
+    detect_correction_in(inserted, after, &PriorContext::default())
+}
 
-    let alpha = |w: &str| w.chars().all(|c| c.is_alphabetic());
-    if mishear.chars().count() < 3 || correct.chars().count() < 3 {
-        return None;
-    }
-    if !alpha(&mishear) || !alpha(&correct) {
-        return None;
-    }
-    if correct.eq_ignore_ascii_case(&mishear) {
-        return None;
-    }
-    if is_common(&correct) || is_common(&mishear) {
-        return None;
-    }
-    // The correction must be phonetically close to what it replaced — a real
-    // mishear, not an unrelated rewrite.
-    let d = norm_levenshtein(&mishear, &correct);
-    if d <= 0.0 || d > 0.6 {
-        return None;
-    }
-    if is_truncation_of(&correct, &mishear) {
-        return None;
-    }
-
-    // Two accept paths.
-    //
-    // Titlecase was previously the *only* one, on the theory that auto-learn exists
-    // for proper nouns. But it silently threw away every lowercase correction —
-    // "wisper" -> "whisper", "tarry" -> "tauri", "cuda" -> "CUDA" — which is a large
-    // share of what actually gets mis-heard when you dictate technical text, and it
-    // does not match how the feature was described ("if I highlight a word, delete
-    // it, and replace it with another one, it'll save it").
-    //
-    // So: Titlecase still qualifies on its own, and a lowercase pair qualifies when
-    // both words are long enough to be distinctive and neither is an ordinary
-    // English word. That second path is looser, which is the point, but it is still
-    // fenced by everything above: exactly one word swapped, both >= 3 chars, both
-    // alphabetic, neither in COMMON, and phonetically close. The realistic failure
-    // is one junk dictionary entry, which is visible in the Hub and removable in a
-    // click — a much smaller cost than silently learning nothing.
-    let titled = correct.chars().next().is_some_and(|c| c.is_uppercase());
-    const MIN_LOWERCASE_LEN: usize = 4;
-    let distinctive_lowercase = mishear.chars().count() >= MIN_LOWERCASE_LEN
-        && correct.chars().count() >= MIN_LOWERCASE_LEN;
-
-    if titled || distinctive_lowercase {
-        Some((mishear, correct))
-    } else {
-        None
-    }
+/// As [`detect_correction`], but told what was already in the field.
+///
+/// `prior` comes from [`PriorContext::from_baseline`] over the **first** read of the
+/// field. Without it, surrounding text can only cause rejection — which is the safe
+/// direction, but it is also the whole defect this replaced.
+pub fn detect_correction_in(
+    inserted: &str,
+    after: &str,
+    prior: &PriorContext,
+) -> Option<(String, String)> {
+    whimpr_core::editshape::learn_from(inserted, after, prior)
 }
 
 /// Decide what, if anything, to learn when an observation window closes.
@@ -800,6 +776,7 @@ pub fn finalize_observation(
     best: Option<&str>,
     last_text: Option<&str>,
     settled: bool,
+    prior: &PriorContext,
 ) -> Option<(String, String)> {
     if !settled {
         return None;
@@ -807,7 +784,7 @@ pub fn finalize_observation(
     [best, last_text]
         .into_iter()
         .flatten()
-        .find_map(|candidate| detect_correction(inserted, candidate))
+        .find_map(|candidate| detect_correction_in(inserted, candidate, prior))
 }
 
 /// Is `candidate` a strict prefix of `original`, short by 2 or more characters?
@@ -851,6 +828,17 @@ fn norm_levenshtein(a: &str, b: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test shim: the observation-lifetime tests are about the TERMINATOR, not about the
+    /// region, so they assume the field held nothing but the paste.
+    fn finalize(
+        inserted: &str,
+        best: Option<&str>,
+        last: Option<&str>,
+        settled: bool,
+    ) -> Option<(String, String)> {
+        finalize_observation(inserted, best, last, settled, &PriorContext::default())
+    }
 
     #[test]
     fn learns_a_name_correction() {
@@ -947,31 +935,44 @@ mod tests {
         }
     }
 
+    /// A case-only correction used to be **invisible**: `word_diff` lowercased before
+    /// comparing, so `Katex → KaTeX` produced an empty diff and never reached a gate —
+    /// even though `DictionaryStore::apply` treats case-only entries as first-class and
+    /// names that exact pair as its motivating example.
+    ///
+    /// After the shape rewrite the alignment **does see it**, as a `C` (Casing) label.
+    /// It is still not *learned*, because there is no substitution to learn from — but
+    /// the difference between "structurally invisible" and "seen and classified" is the
+    /// difference between a dead end and something that could be enabled later.
     #[test]
-    fn a_case_only_correction_is_invisible_before_any_gate() {
-        // Found by this test failing on its first run, against my own wrong belief
-        // that the `eq_ignore_ascii_case` gate was what rejected this pair.
-        //
-        // `word_diff` compares lowercased words, so "Katex" -> "KaTeX" produces an
-        // EMPTY diff — zero removed, zero added — and never reaches a gate at all.
-        // The consequence is the one worth recording: `DictionaryStore::apply` treats
-        // case-only entries as first-class and names this exact pair as its
-        // motivating example, yet auto-learn cannot ever produce one.
-        assert_eq!(
-            word_diff("rendered with Katex", "rendered with KaTeX"),
-            Some((vec![], vec![]))
-        );
-        let r = rejection_reason("rendered with Katex", "rendered with KaTeX");
-        assert!(r.contains("CASE-INSENSITIVE"), "{r}");
+    fn a_case_only_correction_is_now_visible_but_still_not_learned() {
+        use whimpr_core::editshape::analyse;
+        let v = analyse("rendered with Katex", "rendered with KaTeX");
+        assert_eq!(v.labels, "MMC", "casing must be classified, not erased: {v:?}");
+        assert_eq!(v.correction, None, "still nothing to learn without a substitution");
         assert_eq!(detect_correction("rendered with Katex", "rendered with KaTeX"), None);
     }
 
+    /// 🔴 **This test used to assert the defect.** It required `rejection_reason` to say
+    /// "not a 1-for-1 swap … text already in the field counts as added" — i.e. it pinned
+    /// the whole-field set difference as correct behaviour. That behaviour was measured on
+    /// 2026-08-17 to learn **0 of 46** real edits when the field held any prior text, and
+    /// it is gone. The assertion is now the opposite: a one-word fix inside pre-existing
+    /// text is *found*.
     #[test]
-    fn rejection_reason_names_the_whole_field_diff() {
-        // Pre-existing text in the target field is the dominant suspected cause.
-        let r = rejection_reason("fix this word", "i had already typed a lot here fix this term");
-        assert!(r.contains("not a 1-for-1 swap"), "{r}");
-        assert!(r.contains("counts as added"), "{r}");
+    fn a_fix_inside_pre_existing_text_is_no_longer_rejected() {
+        let inserted = "fix this word";
+        let prior_before = "i had already typed a lot here";
+        let baseline = format!("{prior_before} {inserted}");
+        let field = format!("{prior_before} fix this werd");
+        let prior = PriorContext::from_baseline(inserted, &baseline);
+        // The old rule could not see this at all; the aligned diff can.
+        assert_eq!(
+            detect_correction_in(inserted, &field, &prior),
+            Some(("word".to_string(), "werd".to_string())),
+            "{}",
+            rejection_reason_in(inserted, &field, &prior)
+        );
     }
 
     /// Observed in the wild, 2026-08-16: Max dictated "…the Find and Replace system",
@@ -1009,11 +1010,12 @@ mod tests {
             detect_correction("look at the Riemann Hypothesis", "look at the Riemann Hypothe"),
             None
         );
-        assert!(rejection_reason(
-            "look at the Riemann Hypothesis",
-            "look at the Riemann Hypothe"
-        )
-        .contains("TRUNCATION"));
+        // The message changed with the shape rewrite: a boundary truncation is now
+        // classified as an `E` (EditCaptureError) label rather than caught by a
+        // dedicated distance-based gate, so it can never satisfy an accept pattern.
+        let why = rejection_reason("look at the Riemann Hypothesis", "look at the Riemann Hypothe");
+        assert!(why.contains("mid-keystroke"), "{why}");
+        assert!(why.contains('E'), "the label string should show the capture error: {why}");
     }
 
     #[test]
@@ -1062,7 +1064,7 @@ mod tests {
         let inserted = "i use Wimperslow every day";
         let corrected = "i use Whimprflow every day";
         assert_eq!(
-            finalize_observation(inserted, Some(corrected), Some(corrected), true),
+            finalize(inserted, Some(corrected), Some(corrected), true),
             Some(("Wimperslow".to_string(), "Whimprflow".to_string()))
         );
     }
@@ -1076,7 +1078,7 @@ mod tests {
         let corrected = "i use Whimprflow every day";
         // Identical inputs to the test above; only the terminator differs.
         assert_eq!(
-            finalize_observation(inserted, Some(corrected), Some(corrected), false),
+            finalize(inserted, Some(corrected), Some(corrected), false),
             None
         );
     }
@@ -1092,7 +1094,7 @@ mod tests {
         let last = "ping the server Manvi";
         assert_eq!(detect_correction(inserted, best), None);
         assert_eq!(
-            finalize_observation(inserted, Some(best), Some(last), true),
+            finalize(inserted, Some(best), Some(last), true),
             Some(("monvi".to_string(), "Manvi".to_string()))
         );
     }
@@ -1100,7 +1102,7 @@ mod tests {
     /// A window that saw nothing usable stays silent rather than inventing a pair.
     #[test]
     fn nothing_observed_learns_nothing() {
-        assert_eq!(finalize_observation("some dictated words", None, None, true), None);
+        assert_eq!(finalize("some dictated words", None, None, true), None);
     }
 
     /// Termination must not weaken any accept gate — it changes *when* the detector
@@ -1109,16 +1111,14 @@ mod tests {
     #[test]
     fn a_settled_terminator_does_not_relax_the_gates() {
         assert_eq!(
-            finalize_observation("i left there bag", Some("i left their bag"), None, true),
+            finalize("i left there bag", Some("i left their bag"), None, true),
             None
         );
         assert_eq!(
-            finalize_observation(
+            finalize(
                 "look at the Riemann Hypothesis",
                 Some("look at the Riemann Hypothe"),
-                None,
-                true
-            ),
+                None, true),
             None,
             "a truncation must stay rejected even when the window closed cleanly"
         );
