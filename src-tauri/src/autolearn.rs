@@ -185,6 +185,8 @@ mod imp {
             // a clean 1-for-1 swap and a gate had thrown it away. The near-miss is the
             // interesting read; the final one only says whether the text was sent.
             let mut best: Option<(usize, String)> = None;
+            // The correction seen on the previous poll, awaiting confirmation.
+            let mut pending: Option<(String, String)> = None;
 
             for (i, gap) in POLL_GAPS_MS.iter().enumerate() {
                 std::thread::sleep(Duration::from_millis(*gap));
@@ -218,18 +220,40 @@ mod imp {
                                 best = Some((score, after.clone()));
                             }
                         }
-                        if let Some((mishear, correct)) =
-                            super::detect_correction(&inserted, &after)
-                        {
-                            eprintln!(
-                                "[whimpr] ✨ auto-learned: \"{mishear}\" -> \"{correct}\" \
-                                 (poll {}/{})",
-                                i + 1,
-                                POLL_GAPS_MS.len()
-                            );
-                            crate::hotkey::dictionary_learn(correct, vec![mishear]);
-                            learned = true;
-                            break;
+                        // A correction must survive TWO CONSECUTIVE polls before it is
+                        // written. A real correction is something the user typed and
+                        // then left alone; a mid-edit read is gone by the next poll,
+                        // because they are still typing. On 2026-08-16 this exact loop
+                        // caught Max part-way through a word and wrote
+                        // "Hypothesis" -> "Hypothe" to the dictionary from a single
+                        // observation — with `apply()` now live on the hot lane, that
+                        // would have started silently rewriting the word in every
+                        // dictation. One sample is not evidence that an edit is done.
+                        match super::detect_correction(&inserted, &after) {
+                            Some(pair) if pending.as_ref() == Some(&pair) => {
+                                let (mishear, correct) = pair;
+                                eprintln!(
+                                    "[whimpr] ✨ auto-learned: \"{mishear}\" -> \"{correct}\" \
+                                     (held across 2 polls, confirmed at {}/{})",
+                                    i + 1,
+                                    POLL_GAPS_MS.len()
+                                );
+                                crate::hotkey::dictionary_learn(correct, vec![mishear]);
+                                learned = true;
+                                break;
+                            }
+                            Some(pair) => {
+                                eprintln!(
+                                    "[whimpr] auto-learn: candidate \"{}\" -> \"{}\" at poll \
+                                     {}/{} — waiting for it to hold",
+                                    pair.0,
+                                    pair.1,
+                                    i + 1,
+                                    POLL_GAPS_MS.len()
+                                );
+                                pending = Some(pair);
+                            }
+                            None => pending = None,
                         }
                     }
                     None => {
@@ -406,6 +430,12 @@ pub fn rejection_reason(inserted: &str, after: &str) -> String {
              outside (0.0, 0.6] — not phonetically close enough to look like a mishear"
         );
     }
+    if is_truncation_of(correct, mishear) {
+        return format!(
+            "\"{mishear}\" -> \"{correct}\": rejected, \"{correct}\" is a TRUNCATION of \
+             \"{mishear}\" — almost certainly read while still being typed"
+        );
+    }
     let titled = correct.chars().next().is_some_and(|c| c.is_uppercase());
     if !titled && (mishear.chars().count() < 4 || correct.chars().count() < 4) {
         return format!(
@@ -474,6 +504,9 @@ pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)
     if d <= 0.0 || d > 0.6 {
         return None;
     }
+    if is_truncation_of(&correct, &mishear) {
+        return None;
+    }
 
     // Two accept paths.
     //
@@ -501,6 +534,27 @@ pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)
     } else {
         None
     }
+}
+
+/// Is `candidate` a strict prefix of `original`, short by 2 or more characters?
+///
+/// This is the mid-edit guard, and it exists because the phonetic gate cannot be it.
+/// Measured over every entry auto-learn has ever produced, the junk and the real
+/// corrections **overlap**: `Hypothesis -> Hypothe` (a truncation caught while Max was
+/// still typing) and `Wimperslow -> Whimprflow` (the one entry this feature ever got
+/// right) both score exactly 0.30, so no threshold on edit distance can separate them.
+/// A truncation is a *prefix*, and prefixes are among the closest strings to a word by
+/// construction — so distance is least informative exactly where it needs to be sharpest.
+///
+/// The 2-character floor keeps genuine one-character fixes alive: dropping a stray
+/// plural ("Whimprflows" -> "Whimprflow") is a real correction, while dropping four
+/// characters mid-word is someone still typing.
+///
+/// ⚠️ This is a heuristic that shrinks the error, not a fix that removes it. Only an
+/// explicit "add this" gesture removes the guessing — see §0 G3.
+fn is_truncation_of(candidate: &str, original: &str) -> bool {
+    let (c, o) = (candidate.to_lowercase(), original.to_lowercase());
+    o.len().saturating_sub(c.len()) >= 2 && o.starts_with(&c)
 }
 
 fn is_common(w: &str) -> bool {
@@ -672,13 +726,38 @@ mod tests {
     /// phonetic-closeness test does not merely fail to reject mid-edit captures, it
     /// actively selects for them.
     #[test]
-    fn a_mid_edit_truncation_passes_every_gate() {
+    fn a_mid_edit_truncation_is_now_rejected() {
+        // It is "close" precisely because it is a prefix of the real word — which is
+        // why the distance gate admitted it, and why the fix had to be a different
+        // test rather than a different threshold.
+        assert!(norm_levenshtein("Hypothesis", "Hypothe") < 0.6);
         assert_eq!(
             detect_correction("look at the Riemann Hypothesis", "look at the Riemann Hypothe"),
-            Some(("Hypothesis".to_string(), "Hypothe".to_string()))
+            None
         );
-        // …and it is "close" precisely because it is a prefix of the real word.
-        assert!(norm_levenshtein("Hypothesis", "Hypothe") < 0.6);
+        assert!(rejection_reason(
+            "look at the Riemann Hypothesis",
+            "look at the Riemann Hypothe"
+        )
+        .contains("TRUNCATION"));
+    }
+
+    #[test]
+    fn the_truncation_gate_spares_a_one_character_fix() {
+        // Dropping a stray plural is a real correction, not someone mid-word. This is
+        // the case the 2-character floor exists to protect.
+        assert_eq!(
+            detect_correction("i use Whimprflows daily", "i use Whimprflow daily"),
+            Some(("Whimprflows".to_string(), "Whimprflow".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_truncation_gate_leaves_real_corrections_alone() {
+        // Every non-truncation case from the measured corpus must still pass.
+        assert!(detect_correction("i use Wimperslow", "i use Whimprflow").is_some());
+        assert!(detect_correction("send it to monvi", "send it to Manvi").is_some());
+        assert!(detect_correction("i use wisper here", "i use whisper here").is_some());
     }
 
     #[test]
