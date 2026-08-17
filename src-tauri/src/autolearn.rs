@@ -171,12 +171,29 @@ mod imp {
             let mut consecutive_failures = 0usize;
             let mut learned = false;
 
+            // Diagnostic state only — never consulted by the decision path below.
+            // "N read(s), no clean one-word correction found" was logged 93 times out
+            // of 95 sessions between 08-09 and 08-16 and never once said which gate
+            // did the rejecting, so every "auto-learn doesn't work" report had to be
+            // answered by guessing. These three track the shape of what was seen.
+            let mut last_text: Option<String> = None;
+            let mut empty_reads = 0usize;
+
             for (i, gap) in POLL_GAPS_MS.iter().enumerate() {
                 std::thread::sleep(Duration::from_millis(*gap));
                 match unsafe { element_value(holder.0) } {
                     Some(after) => {
                         reads_ok += 1;
                         consecutive_failures = 0;
+                        if after.trim().is_empty() {
+                            // The field emptied under us — the overwhelmingly likely
+                            // cause is the user sending the message. Worth counting
+                            // separately: a correction made before the send is
+                            // invisible by the time we look.
+                            empty_reads += 1;
+                        } else {
+                            last_text = Some(after.clone());
+                        }
                         if let Some((mishear, correct)) =
                             super::detect_correction(&inserted, &after)
                         {
@@ -216,6 +233,19 @@ mod imp {
                         "[whimpr] auto-learn: {reads_ok} read(s), no clean one-word \
                          correction found"
                     );
+                    // ...and *why*. Judged on the last non-empty read, because that
+                    // is the state closest to what the user actually left behind.
+                    match &last_text {
+                        Some(after) => eprintln!(
+                            "[whimpr] auto-learn: WHY: {} (empty reads: {empty_reads}/{reads_ok})",
+                            super::rejection_reason(&inserted, after)
+                        ),
+                        None => eprintln!(
+                            "[whimpr] auto-learn: WHY: every read was an empty field \
+                             ({empty_reads}/{reads_ok}) — text was almost certainly sent \
+                             or cleared before we looked"
+                        ),
+                    }
                 }
             }
         });
@@ -251,10 +281,19 @@ const COMMON: &[&str] = &[
     "yeah", "hey", "hello", "please", "thanks", "thank", "message", "email", "text", "call",
 ];
 
-/// Detect a single clean one-word correction: exactly one word removed from the
-/// inserted text and one word added in the field, both distinctive and phonetically
-/// close, with the new word looking like a proper noun. Returns `(mishear, correct)`.
-pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)> {
+/// The distinct words removed from `inserted` and added in `after`, as a set
+/// difference. `None` when either side has no words at all.
+///
+/// De-duplicated: a word appearing twice is still one distinct change — the version
+/// before 2026-08-06 filtered the token *Vec* while testing set membership, so
+/// dictating "monvi and monvi" and fixing both produced `removed.len() == 2` and was
+/// silently rejected as "too ambiguous".
+///
+/// ⚠️ **This is a difference over the WHOLE field**, which is the single biggest
+/// reason auto-learn rejects real corrections: every word already in the target field
+/// that was not in the dictation counts as "added". A one-word fix inside a field that
+/// held any prior text is therefore never a clean 1-for-1 swap.
+fn word_diff(inserted: &str, after: &str) -> Option<(Vec<String>, Vec<String>)> {
     use std::collections::HashSet;
     let ins = word_tokens(inserted);
     let aft = word_tokens(after);
@@ -264,10 +303,6 @@ pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)
     let ins_lc: HashSet<String> = ins.iter().map(|w| w.to_lowercase()).collect();
     let aft_lc: HashSet<String> = aft.iter().map(|w| w.to_lowercase()).collect();
 
-    // De-duplicate. This is a set difference, so a word that appears twice is still
-    // one distinct change — the previous version filtered the token *Vec* while
-    // testing set membership, so dictating "monvi and monvi" and fixing both
-    // produced removed.len() == 2 and was silently rejected as "too ambiguous".
     let diff = |from: &[String], other: &HashSet<String>| -> Vec<String> {
         let mut seen = HashSet::new();
         from.iter()
@@ -276,8 +311,97 @@ pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)
             .cloned()
             .collect()
     };
-    let removed = diff(&ins, &aft_lc);
-    let added = diff(&aft, &ins_lc);
+    Some((diff(&ins, &aft_lc), diff(&aft, &ins_lc)))
+}
+
+/// Explain, **for the log only**, why [`detect_correction`] rejected a field read.
+///
+/// This mirrors that function's gate order rather than being wired into it, so the
+/// decision path stays byte-for-byte unchanged and switching the diagnostic on cannot
+/// alter what gets learned. It exists because `"no clean one-word correction found"`
+/// was logged on 93 of 95 watch sessions (2026-08-09 → 08-16) without ever saying
+/// which gate fired — leaving every "auto-learn doesn't work" report unanswerable.
+///
+/// ⚠️ Keep the gate order in sync with [`detect_correction`]; the shared front half is
+/// [`word_diff`], but the checks below are deliberately duplicated so that a change
+/// here can never change behaviour there.
+pub fn rejection_reason(inserted: &str, after: &str) -> String {
+    let Some((removed, added)) = word_diff(inserted, after) else {
+        return "one side had no words at all (field empty, or nothing pasted)".into();
+    };
+
+    if removed.is_empty() && added.is_empty() {
+        // No visible change at all. Worth its own message because one important case
+        // lands here rather than at any gate: `word_diff` compares lowercased words,
+        // so a CASE-ONLY correction cancels out and is invisible before any gate runs.
+        // `DictionaryStore::apply` explicitly supports case-only entries and names
+        // "Katex" -> "KaTeX" as its motivating example — but auto-learn can never
+        // produce one. (This is also why the `eq_ignore_ascii_case` check inside
+        // `detect_correction` is unreachable in practice: a pair that differs by case
+        // alone never survives the diff to reach it.)
+        return "no word-level difference between the pasted text and the field \
+                — note the diff is CASE-INSENSITIVE, so a case-only fix such as \
+                \"Katex\" -> \"KaTeX\" is invisible to auto-learn by construction"
+            .into();
+    }
+
+    if removed.len() != 1 || added.len() != 1 {
+        return format!(
+            "not a 1-for-1 swap — {} word(s) removed {:?}, {} word(s) added {:?} \
+             (whole-field diff: text already in the field counts as added)",
+            removed.len(),
+            preview(&removed),
+            added.len(),
+            preview(&added),
+        );
+    }
+
+    let mishear = &removed[0];
+    let correct = &added[0];
+    let alpha = |w: &str| w.chars().all(|c| c.is_alphabetic());
+
+    if mishear.chars().count() < 3 || correct.chars().count() < 3 {
+        return format!("\"{mishear}\" -> \"{correct}\": rejected, a word is under 3 chars");
+    }
+    if !alpha(mishear) || !alpha(correct) {
+        return format!("\"{mishear}\" -> \"{correct}\": rejected, non-alphabetic");
+    }
+    if correct.eq_ignore_ascii_case(mishear) {
+        // Unreachable in practice — see the empty-diff branch above. Kept so the two
+        // gate sequences stay structurally aligned.
+        return format!("\"{mishear}\" -> \"{correct}\": rejected, differs by case only");
+    }
+    if is_common(correct) || is_common(mishear) {
+        return format!("\"{mishear}\" -> \"{correct}\": rejected, an ordinary English word");
+    }
+    let d = norm_levenshtein(mishear, correct);
+    if d <= 0.0 || d > 0.6 {
+        return format!(
+            "\"{mishear}\" -> \"{correct}\": rejected, normalized edit distance {d:.2} \
+             outside (0.0, 0.6] — not phonetically close enough to look like a mishear"
+        );
+    }
+    let titled = correct.chars().next().is_some_and(|c| c.is_uppercase());
+    if !titled && (mishear.chars().count() < 4 || correct.chars().count() < 4) {
+        return format!(
+            "\"{mishear}\" -> \"{correct}\": rejected, lowercase and under 4 chars \
+             (not distinctive enough)"
+        );
+    }
+
+    format!("\"{mishear}\" -> \"{correct}\": all gates passed (unexpected — should have been learned)")
+}
+
+/// First few words of a diff list, so a 200-word field does not fill the log.
+fn preview(words: &[String]) -> Vec<&str> {
+    words.iter().take(4).map(|w| w.as_str()).collect()
+}
+
+/// Detect a single clean one-word correction: exactly one word removed from the
+/// inserted text and one word added in the field, both distinctive and phonetically
+/// close, with the new word looking like a proper noun. Returns `(mishear, correct)`.
+pub fn detect_correction(inserted: &str, after: &str) -> Option<(String, String)> {
+    let (removed, added) = word_diff(inserted, after)?;
     if removed.len() != 1 || added.len() != 1 {
         return None; // only learn on a clean 1-for-1 swap
     }
@@ -416,6 +540,70 @@ mod tests {
             detect_correction("ping the server quickly", "ping the server xylophone"),
             None
         );
+    }
+
+    /// The diagnostic must never disagree with the decision it explains. This is the
+    /// guard against the two gate sequences drifting apart: `rejection_reason` says
+    /// "all gates passed" if and only if `detect_correction` actually returns a pair.
+    #[test]
+    fn rejection_reason_never_contradicts_detect_correction() {
+        let cases = [
+            ("send the deck to monvi please", "send the deck to Manvi please"),
+            ("i left there bag", "i left their bag"),
+            ("meet at noon monvi", "see you later Manvi"),
+            ("ping the server foo", "ping the server Xylophone"),
+            ("hello there world", "hello there world"),
+            ("i use wisper for this", "i use whisper for this"),
+            ("monvi and monvi again", "Manvi and Manvi again"),
+            ("the cat sat down", "the bat sat down"),
+            ("rendered with Katex", "rendered with KaTeX"),
+            ("a dictation", ""),
+            ("", "some text"),
+            ("fix this word", "i had already typed a lot here fix this term"),
+        ];
+        for (ins, aft) in cases {
+            let passed = rejection_reason(ins, aft).contains("all gates passed");
+            assert_eq!(
+                passed,
+                detect_correction(ins, aft).is_some(),
+                "disagreement on ({ins:?}, {aft:?}): reason said {:?}",
+                rejection_reason(ins, aft)
+            );
+        }
+    }
+
+    #[test]
+    fn a_case_only_correction_is_invisible_before_any_gate() {
+        // Found by this test failing on its first run, against my own wrong belief
+        // that the `eq_ignore_ascii_case` gate was what rejected this pair.
+        //
+        // `word_diff` compares lowercased words, so "Katex" -> "KaTeX" produces an
+        // EMPTY diff — zero removed, zero added — and never reaches a gate at all.
+        // The consequence is the one worth recording: `DictionaryStore::apply` treats
+        // case-only entries as first-class and names this exact pair as its
+        // motivating example, yet auto-learn cannot ever produce one.
+        assert_eq!(
+            word_diff("rendered with Katex", "rendered with KaTeX"),
+            Some((vec![], vec![]))
+        );
+        let r = rejection_reason("rendered with Katex", "rendered with KaTeX");
+        assert!(r.contains("CASE-INSENSITIVE"), "{r}");
+        assert_eq!(detect_correction("rendered with Katex", "rendered with KaTeX"), None);
+    }
+
+    #[test]
+    fn rejection_reason_names_the_whole_field_diff() {
+        // Pre-existing text in the target field is the dominant suspected cause.
+        let r = rejection_reason("fix this word", "i had already typed a lot here fix this term");
+        assert!(r.contains("not a 1-for-1 swap"), "{r}");
+        assert!(r.contains("counts as added"), "{r}");
+    }
+
+    #[test]
+    fn rejection_reason_handles_an_emptied_field() {
+        // The "user hit send" shape.
+        let r = rejection_reason("some dictated words", "");
+        assert!(r.contains("no words at all"), "{r}");
     }
 
     #[test]
