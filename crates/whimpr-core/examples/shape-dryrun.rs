@@ -57,8 +57,9 @@ fn unescape(s: &str) -> String {
     s.replace("\\t", "\t").replace("\\n", "\n").replace("\\\\", "\\")
 }
 
-/// Real prior text, taken verbatim from the Notes note Max was dictating into on
-/// 2026-08-17 when the whole-field set difference rejected his correction.
+/// Stand-in for the surrounding text a real document has. Modelled on the note that
+/// exposed the whole-field set difference on 2026-08-17 — same shape (a scrappy
+/// eleven-word list, no punctuation, mixed case), synthetic content.
 const PRIOR_BEFORE: &str = "TODO groceries milk eggs return library books Friday check tire pressure";
 const PRIOR_AFTER: &str = "and then some older notes below";
 

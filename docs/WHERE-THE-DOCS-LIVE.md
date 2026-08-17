@@ -1,9 +1,8 @@
 # Where the written record lives
 
 Session reports, findings and open decisions for this project are **not in this repo**.
-They live in Max's Obsidian vault, which is the only place he reads them:
-
-    <local vault>/
+They live in the maintainer's Obsidian vault, which is the only place they get read.
+The vault path is local and deliberately not recorded here; ask if you need it.
 
 - `project.md` — the knowledge base. **Read this before working on anything here.**
   Known bugs with documented fixes live in it, and sessions have burned time
