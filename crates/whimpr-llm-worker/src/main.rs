@@ -15,7 +15,8 @@ use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::TokenToStringError;
 use llama_cpp_2::sampling::LlamaSampler;
 use serde::{Deserialize, Serialize};
 
@@ -136,7 +137,19 @@ fn generate(
 
     let mut sampler = LlamaSampler::greedy();
     let mut n_cur = batch.n_tokens();
-    let mut out = String::new();
+    // Accumulate raw BYTES, not per-token Strings. A multi-byte character the
+    // vocab has no single token for is emitted as byte-fallback tokens, so its
+    // UTF-8 sequence is split across several tokens. `token_to_str` builds a
+    // fresh UTF-8 decoder per call and discards it, so each fragment is an
+    // incomplete or invalid sequence and the character is dropped SILENTLY —
+    // no error, no replacement char, just a hole in the output. Measured
+    // 2026-08-17: an echo of "∮ ∑ ∫ ∞ θ ζ π γ ε δ ₀ ² − √ Γ ∂" came back as
+    // "∮      π γ ε δ ₀ ² −  Γ" on BOTH the 1.5b and the 4b — identical losses
+    // from two different models, which is what proves it is this decode path
+    // and not model capability. ∑ ∫ ∞ θ ζ √ ∂ ñ are the casualties; every
+    // single-token glyph (∮ π γ ε δ ₀ ² − Γ) survived. Ordinary English is
+    // unaffected — em dash, ellipsis, curly quotes, é, °, ½, → all round-trip.
+    let mut out_bytes: Vec<u8> = Vec::new();
     let limit = n_prompt + req.max_tokens;
 
     while n_cur <= limit {
@@ -145,11 +158,26 @@ fn generate(
         if model.is_eog_token(token) {
             break;
         }
-        out.push_str(&model.token_to_str(token, Special::Tokenize)?);
+        // The 8-byte guess is what the crate's own helper uses, and it is too
+        // small for some pieces — a bare call returns InsufficientBufferSpace(-n)
+        // and, with `?`, kills the whole request. Retry at the size it asks for.
+        let piece = match model.token_to_piece_bytes(token, 8, true, None) {
+            Err(TokenToStringError::InsufficientBufferSpace(n)) => model.token_to_piece_bytes(
+                token,
+                usize::try_from(-n).expect("buffer size is positive"),
+                true,
+                None,
+            )?,
+            other => other?,
+        };
+        out_bytes.extend_from_slice(&piece);
         batch.clear();
         batch.add(token, n_cur, &[0], true)?;
         n_cur += 1;
         ctx.decode(&mut batch)?;
     }
-    Ok(out.trim().to_string())
+    // Lossy on purpose: a genuinely malformed byte should cost one replacement
+    // char, never the whole dictation. Decoding once at the end is what lets a
+    // split sequence reassemble.
+    Ok(String::from_utf8_lossy(&out_bytes).trim().to_string())
 }
