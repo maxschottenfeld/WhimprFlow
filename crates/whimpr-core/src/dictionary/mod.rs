@@ -264,8 +264,8 @@ impl DictionaryStore {
             // ⚠️ Bias alone is NOT a substitute for this stage, which is why the
             // approve step exists rather than dropping rewriting altogether.
             // Measured on the harness 2026-08-17 over `fixtures/propernouns.wav`:
-            // the glossary fixed `WimpherFlow -> Whimprflow`, `Schachenfeld ->
-            // Thornbury` and `Celero -> Silero`, but left `Tauri` as "entry",
+            // the glossary fixed `WimpherFlow -> Whimprflow`, a surname it had been
+            // mishearing, and `Celero -> Silero`, but left `Tauri` as "entry",
             // and it *introduced* `Whisper -> WISPR`, a word that was correct
             // without the prompt and is not in the glossary at all. Bias is
             // probabilistic and has collateral effects on neighbours; only this

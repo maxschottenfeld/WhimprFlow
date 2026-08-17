@@ -22,6 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_DIRS: &[&str] = &[
+    // Point these at a log snapshot, or pass directories as arguments.
     "log-snapshot/live",
     "log-snapshot/tmp-0815",
 ];

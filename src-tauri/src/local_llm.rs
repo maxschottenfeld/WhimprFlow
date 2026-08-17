@@ -1,59 +1,16 @@
-//! Spawns and talks to the local-LLM cleanup worker (a separate process, so
-//! llama.cpp and whisper.cpp never link into the same binary). One JSON request
-//! per line over stdio: `{system,user}` -> `{text}`.
+//! Finds and spawns the local-LLM worker (a separate process, so llama.cpp and
+//! whisper.cpp never link into the same binary).
+//!
+//! The **protocol** — one JSON request per line over stdio — lives in
+//! `whimpr_core::worker` so the app and the offline harness share a single
+//! implementation and cannot drift apart. What stays here is the part that is
+//! genuinely app-specific: where the binary and the model live inside a bundle.
 
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-pub struct LocalWorker {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl LocalWorker {
-    pub fn spawn(worker_bin: &Path, model: &Path) -> anyhow::Result<Self> {
-        let mut child = Command::new(worker_bin)
-            .arg(model)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?);
-        Ok(Self { child, stdin, stdout })
-    }
-
-    /// Send one cleanup request (system prompt + few-shot turns + transcript) and
-    /// read the response (blocks until the line comes).
-    pub fn cleanup(
-        &mut self,
-        messages: &[whimpr_core::cleanup::CleanupMsg],
-    ) -> anyhow::Result<String> {
-        let req = serde_json::json!({ "messages": messages, "max_tokens": 400 });
-        let mut line = serde_json::to_string(&req)?;
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.flush()?;
-
-        let mut resp = String::new();
-        if self.stdout.read_line(&mut resp)? == 0 {
-            anyhow::bail!("local worker closed");
-        }
-        let v: serde_json::Value = serde_json::from_str(&resp)?;
-        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-            anyhow::bail!("local llm: {err}");
-        }
-        Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
-    }
-}
-
-impl Drop for LocalWorker {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-    }
-}
+/// Re-exported so existing call sites (`local_llm::LocalWorker`) keep reading the
+/// same. The type itself is `whimpr_core::worker::LocalWorker`.
+pub use whimpr_core::worker::LocalWorker;
 
 /// Platform application-support dir: `~/Library/Application Support/WhimprFlow`
 /// on macOS, `%APPDATA%\WhimprFlow Dev` on Windows. Deliberately separate from the
@@ -132,38 +89,87 @@ pub fn worker_bin_path() -> Option<PathBuf> {
     }
 }
 
-/// The local cleanup model path (same models dir as whisper/ASR). Prefer the
-/// larger, much more capable Qwen3-4B if present (far better at
-/// self-corrections and structure than the 1.5B); fall back to the 1.5B otherwise.
+/// The local model path (same models dir as whisper/ASR). Prefer the larger,
+/// much more capable Qwen3-4B if present (far better at self-corrections and
+/// structure than the 1.5B); fall back to the 1.5B otherwise.
+///
+/// 🔴 **Pinned to the 1.5B on purpose — this is not an oversight, and the 4B must
+/// not be added back to this list.** Max's decision, 2026-08-17: the two stages
+/// get different models, *"the 4B for math, the 1.5 to the cleanup."* Cleanup runs
+/// on the hot path where a human is waiting on ordinary dictation, and the 4B
+/// costs roughly three times as long; the math stage runs behind a hotkey pressed
+/// deliberately for accuracy, where that wait is the point.
+///
+/// Pinning also **defuses a footgun**. Until this commit the 4B was preferred
+/// here and merely happened to be absent, parked under a `.candidate` suffix — so
+/// dropping that suffix would silently have re-modelled the daily driver's
+/// cleanup. A rename in the models directory is now safe: it changes the math
+/// stage (see [`math_model_path`]) and nothing else.
 pub fn model_path() -> PathBuf {
+    app_support_dir()
+        .join("models")
+        .join("qwen2.5-1.5b-instruct-q4_k_m.gguf")
+}
+
+/// The model for the spoken-math stage: the 4B, which is markedly better at this
+/// specific job than the 1.5B and is allowed to be slower for it.
+///
+/// Measured 2026-08-17 over the eleven-input evaluation set, and again live on
+/// Max's own voice: on *"the contour integral around gamma of f of z over z minus
+/// z naught dz"* the 1.5B returned `The contour integral around γ of f(z)/(z − z₀)
+/// dz` — leaving the operator as English words — while the 4B returned
+/// `∮_γ f(z)/(z − z₀) dz`. Across the set the 1.5B also **silently dropped terms**
+/// (`π^S` for "pi to the S minus 1", losing the −1), which is the worst failure
+/// available here because the result still looks plausible.
+///
+/// **Accepts the `.candidate` suffix**, so the 4B works whether or not it has been
+/// renamed — the file is currently parked that way and renaming it is a decision
+/// nothing here should force. Falls back to the 1.5B if no 4B is present at all,
+/// so math mode degrades to worse notation rather than to no feature.
+pub fn math_model_path() -> PathBuf {
     let dir = app_support_dir().join("models");
     for name in [
         "qwen3-4b-instruct-2507-q4_k_m.gguf",
-        "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        "qwen3-4b-instruct-2507-q4_k_m.gguf.candidate",
     ] {
         let p = dir.join(name);
         if p.exists() {
             return p;
         }
     }
-    dir.join("qwen2.5-1.5b-instruct-q4_k_m.gguf")
+    model_path()
 }
 
-/// Spawn the worker if both the binary and the model are present.
+/// Spawn the cleanup worker if both the binary and the model are present.
 pub fn spawn_default() -> Option<LocalWorker> {
+    spawn_with(&model_path(), "cleanup")
+}
+
+/// Spawn the math worker. Separate process from cleanup, holding a separate model
+/// — that is the whole point, and it costs a second resident model (~2.4 GB) while
+/// it is alive. Spawned lazily on first use, never at startup, so a user who never
+/// presses the math gesture never pays for it.
+pub fn spawn_math() -> Option<LocalWorker> {
+    spawn_with(&math_model_path(), "math")
+}
+
+fn spawn_with(model: &Path, label: &str) -> Option<LocalWorker> {
     let bin = worker_bin_path()?;
-    let model = model_path();
     if !model.exists() {
-        eprintln!("[whimpr] local model not found at {}", model.display());
+        eprintln!("[whimpr] {label} model not found at {}", model.display());
         return None;
     }
-    match LocalWorker::spawn(&bin, &model) {
+    match LocalWorker::spawn(&bin, model) {
         Ok(w) => {
-            eprintln!("[whimpr] local LLM worker started ({})", bin.display());
+            eprintln!(
+                "[whimpr] {label} LLM worker started ({} · {})",
+                bin.display(),
+                model.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+            );
             Some(w)
         }
         Err(e) => {
-            eprintln!("[whimpr] local LLM worker failed to start: {e}");
+            eprintln!("[whimpr] {label} LLM worker failed to start: {e}");
             None
         }
     }
