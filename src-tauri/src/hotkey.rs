@@ -90,7 +90,7 @@ mod imp {
     // physical key. See memory/projects/WhimprFlow/project.md, Phase 0.
     const FLAG_HOTKEY_MODIFIER: u64 = 0x0080_0000; // kCGEventFlagMaskSecondaryFn
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
-    const KEYCODE_HOTKEY: i64 = 61; // kVK_RightOption
+    const KEYCODE_HOTKEY: i64 = 63; // kVK_Function
     /// Hold Shift while pressing the dictation hotkey to dictate MATHEMATICS —
     /// the transcript is converted to notation instead of being cleaned up (G2).
     ///
@@ -1192,7 +1192,7 @@ mod imp {
                         ensure_math_worker();
                     }
                     eprintln!(
-                        "[whimpr] Right Option DOWN{}",
+                        "[whimpr] Fn DOWN{}",
                         if math { " + Shift — MATH MODE" } else { "" }
                     );
                     // Snapshot the paste target now, while the user's app is focused.
