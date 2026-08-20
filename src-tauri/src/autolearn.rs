@@ -301,10 +301,16 @@ mod imp {
             // output whatsoever, and this was the only branch that could account for it
             // (paste never failed, so Accessibility was granted, and the dictations were
             // far longer than the two-token floor). Which apps fail to expose a focused
-            // element is still unmeasured — this line is what will measure it.
+            // element was unmeasured when this line was added — it stayed unmeasured
+            // through 2026-08-18 (68/68 nulls that day) because the line didn't say
+            // *which* app. `frontmost_bundle_id()` is a plain NSWorkspace read (no
+            // Accessibility needed) and the overlay is non-activating, so the frontmost
+            // app here is still the paste target — safe to log directly.
+            let app = crate::appctx::frontmost_bundle_id();
             eprintln!(
                 "[whimpr] auto-learn: no focused UI element from the frontmost app \
-                 — not watching this dictation"
+                 ({}) — not watching this dictation",
+                app.as_deref().unwrap_or("<unknown>")
             );
             return;
         }
