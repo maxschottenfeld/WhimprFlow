@@ -1198,6 +1198,11 @@ mod imp {
                     // Snapshot the paste target now, while the user's app is focused.
                     let target = crate::appctx::frontmost_bundle_id();
                     *TARGET_APP.get_or_init(|| Mutex::new(None)).lock().unwrap() = target;
+                    // Same trick as the math worker above, for the same reason: the
+                    // user is about to speak for several seconds. Electron apps need
+                    // that long to build the accessibility tree auto-learn reads, and
+                    // asking for it at paste time is measurably too late.
+                    crate::autolearn::prewarm_accessibility();
                     handle_input(Input::Trigger(TriggerToken::Down {
                         binding: BindingId::PushToTalk,
                         at_ms,
