@@ -28,6 +28,26 @@ pub fn frontmost_bundle_id() -> Option<String> {
     }
 }
 
+/// PID of the frontmost application. Same NSWorkspace read as
+/// `frontmost_bundle_id()` — public information, no TCC permission — but the
+/// Accessibility API addresses an app by pid, not by bundle id, so the manual
+/// accessibility opt-in in `autolearn` needs this form.
+#[cfg(target_os = "macos")]
+#[allow(unused_unsafe)]
+pub fn frontmost_pid() -> Option<i32> {
+    use objc2_app_kit::NSWorkspace;
+    unsafe {
+        let ws = NSWorkspace::sharedWorkspace();
+        let app = ws.frontmostApplication()?;
+        Some(app.processIdentifier())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn frontmost_pid() -> Option<i32> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn frontmost_bundle_id() -> Option<String> {
     None

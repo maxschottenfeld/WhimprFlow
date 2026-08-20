@@ -61,11 +61,22 @@ mod imp {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
         fn AXUIElementCopyAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> i32;
+        fn AXUIElementSetAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: CFTypeRef,
+        ) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFBooleanTrue: CFTypeRef;
     }
 
     fn make_cfstring(s: &str) -> CFStringRef {
@@ -113,6 +124,59 @@ mod imp {
             return ptr::null();
         }
         focused as AXUIElementRef
+    }
+
+    /// Ask a Chromium-based app to build its accessibility tree.
+    ///
+    /// Electron apps (Obsidian, Claude Desktop, Slack, VS Code) render their UI as
+    /// HTML rather than as AppKit controls. Chromium *can* expose that as an
+    /// accessibility tree, but building one is expensive, so it stays off until a
+    /// client asks. Setting `AXManualAccessibility` on the application element is
+    /// the documented way to ask.
+    ///
+    /// Measured 2026-08-20, one dictation per app: Notes (native) and Chrome read
+    /// fine; Obsidian and Claude Desktop returned null every time. That is the
+    /// pattern this addresses — G3's learn half is dead in exactly the two apps the
+    /// user works in most.
+    ///
+    /// Returns whether the set call reported success. Best-effort by design: a
+    /// failure here just means the retry finds nothing, same as today.
+    unsafe fn enable_manual_accessibility(pid: i32) -> bool {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        let attr = make_cfstring("AXManualAccessibility");
+        let mut ok = false;
+        if !attr.is_null() {
+            ok = AXUIElementSetAttributeValue(app, attr, kCFBooleanTrue) == 0;
+            CFRelease(attr);
+        }
+        CFRelease(app as CFTypeRef);
+        ok
+    }
+
+    /// Set `AXManualAccessibility` on the frontmost app at the moment the user
+    /// starts speaking, so the tree is built by the time the paste lands.
+    ///
+    /// 🔴 The timing is the whole point, and it was measured rather than assumed.
+    /// 2026-08-20, Obsidian: setting the flag and re-reading immediately still
+    /// returned null (`set=true retry=still null`), and the *next* dictation —
+    /// same flag, seconds later, no code change — read fine. Chromium builds the
+    /// tree asynchronously, so a set-then-read at paste time is always too early.
+    /// Fn-down gives it the length of the dictation.
+    ///
+    /// Runs off the tap thread for the same reason `ensure_math_worker` does: the
+    /// keyboard callback must never block or macOS disables the event tap. No
+    /// caching by pid — one cheap call per dictation self-heals when the target
+    /// app restarts, which a pid cache would not.
+    pub fn prewarm_accessibility() {
+        let Some(pid) = crate::appctx::frontmost_pid() else {
+            return;
+        };
+        std::thread::spawn(move || unsafe {
+            enable_manual_accessibility(pid);
+        });
     }
 
     /// Read a text element's AXValue as a string.
@@ -293,9 +357,29 @@ mod imp {
             return;
         }
         let inserted = inserted.to_string();
-        let focused = unsafe { copy_focused_element() };
+        let mut focused = unsafe { copy_focused_element() };
         let app_id = crate::appctx::frontmost_bundle_id();
         let app = app_id.as_deref().unwrap_or("<unknown>");
+
+        // Second chance for Chromium-based apps. Deliberately only on the failing
+        // path: apps that already answer (Notes, Chrome) pay nothing, and the extra
+        // cost lands where the alternative was learning nothing at all. This runs
+        // after the paste and after the metrics line, so it is off the latency path
+        // the user feels.
+        if focused.is_null() {
+            if let Some(pid) = crate::appctx::frontmost_pid() {
+                let asked = unsafe { enable_manual_accessibility(pid) };
+                focused = unsafe { copy_focused_element() };
+                eprintln!(
+                    "[whimpr] auto-learn: {} returned no focused element; \
+                     AXManualAccessibility set={} retry={}",
+                    app,
+                    asked,
+                    if focused.is_null() { "still null" } else { "GOT ONE" }
+                );
+            }
+        }
+
         if focused.is_null() {
             // Observability only. This path used to return in total silence, and that
             // silence is what made "highlight-to-add hasn't been working" undiagnosable
@@ -618,10 +702,13 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::watch_correction;
+pub use imp::{prewarm_accessibility, watch_correction};
 
 #[cfg(not(target_os = "macos"))]
 pub fn watch_correction(_inserted: &str) {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn prewarm_accessibility() {}
 
 use whimpr_core::editshape::PriorContext;
 
