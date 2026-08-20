@@ -294,6 +294,8 @@ mod imp {
         }
         let inserted = inserted.to_string();
         let focused = unsafe { copy_focused_element() };
+        let app_id = crate::appctx::frontmost_bundle_id();
+        let app = app_id.as_deref().unwrap_or("<unknown>");
         if focused.is_null() {
             // Observability only. This path used to return in total silence, and that
             // silence is what made "highlight-to-add hasn't been working" undiagnosable
@@ -302,18 +304,25 @@ mod imp {
             // (paste never failed, so Accessibility was granted, and the dictations were
             // far longer than the two-token floor). Which apps fail to expose a focused
             // element was unmeasured when this line was added — it stayed unmeasured
-            // through 2026-08-18 (68/68 nulls that day) because the line didn't say
+            // through 2026-08-18 (68/68 nulls in the audited window) because it didn't say
             // *which* app. `frontmost_bundle_id()` is a plain NSWorkspace read (no
             // Accessibility needed) and the overlay is non-activating, so the frontmost
             // app here is still the paste target — safe to log directly.
-            let app = crate::appctx::frontmost_bundle_id();
             eprintln!(
                 "[whimpr] auto-learn: no focused UI element from the frontmost app \
                  ({}) — not watching this dictation",
-                app.as_deref().unwrap_or("<unknown>")
+                app
             );
             return;
         }
+        // The success side has to name its app too, or the log can only ever show where
+        // the read FAILED. On 2026-08-20 a four-app run (Notes, Obsidian, Claude Desktop,
+        // Chrome) produced two nulls that named themselves and two successes that did
+        // not, so attributing the working half needed the user's own recollection —
+        // the same "fix the instrument before spending his time" cost this project paid
+        // on 08-17. One line makes the log self-contained.
+        eprintln!("[whimpr] auto-learn: watching ({})", app);
+
         let holder = SendPtr(focused);
         let handle = Arc::new(WatchHandle::new());
         *active().lock().unwrap() = Some(Arc::clone(&handle));
