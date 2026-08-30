@@ -14,6 +14,8 @@ export interface Settings {
   openai_base_url: string;
   anthropic_model: string;
   sound_on_start: boolean;
+  // Show the Flow Bar pill while idle. Off means it only appears while dictating.
+  show_idle_pill: boolean;
 }
 
 export interface Status {
@@ -57,6 +59,7 @@ export const DEFAULT_SETTINGS: Settings = {
   openai_base_url: "",
   anthropic_model: "claude-haiku-4-5",
   sound_on_start: true,
+  show_idle_pill: true,
 };
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {

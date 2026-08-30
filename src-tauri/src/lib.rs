@@ -29,6 +29,13 @@ struct BarStatePayload {
     state: &'static str,
 }
 
+/// The subset of Settings the Flow Bar overlay cares about, pushed to it whenever
+/// the Hub saves.
+#[derive(Clone, Serialize)]
+struct OverlaySettingsPayload {
+    show_idle_pill: bool,
+}
+
 /// Anchor the overlay window bottom-center of its monitor.
 fn position_overlay(w: &WebviewWindow) {
     // current_monitor() can be None before the window maps; fall back sensibly.
@@ -126,7 +133,17 @@ fn get_settings() -> whimpr_core::Settings {
 }
 
 #[tauri::command]
-fn set_settings(settings: whimpr_core::Settings) {
+fn set_settings(app: tauri::AppHandle, settings: whimpr_core::Settings) {
+    // Push the overlay-relevant bits before storing, so toggling the idle pill in
+    // the Hub takes effect immediately instead of at the next launch. The overlay
+    // also reads settings once on mount, which covers the startup case.
+    let _ = app.emit_to(
+        OVERLAY_LABEL,
+        "whimpr://settings/changed",
+        OverlaySettingsPayload {
+            show_idle_pill: settings.show_idle_pill,
+        },
+    );
     hotkey::update_settings(settings);
 }
 

@@ -14,12 +14,26 @@ export type BarState =
 type StateEvent = { state: BarState };
 type WaveformEvent = { bars: number[] };
 
+type SettingsEvent = { show_idle_pill: boolean };
+
 async function tauriListen<T>(event: string, cb: (payload: T) => void): Promise<() => void> {
   try {
     const { listen } = await import("@tauri-apps/api/event");
     return await listen<T>(event, (e) => cb(e.payload as T));
   } catch {
     return () => {};
+  }
+}
+
+// Read the one setting the overlay needs. Outside the Tauri shell (vite preview)
+// the import throws, so fall back to showing the pill — the old behavior.
+async function readShowIdlePill(): Promise<boolean> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const settings = await invoke<{ show_idle_pill?: boolean }>("get_settings");
+    return settings.show_idle_pill !== false;
+  } catch {
+    return true;
   }
 }
 
@@ -118,20 +132,33 @@ function StopButton() {
 export function FlowBar() {
   const [state, setState] = useState<BarState>("idle");
   const [bars, setBars] = useState<number[]>([]);
+  // `null` = not read yet. The idle pill stays hidden until the answer arrives so
+  // someone who turned it off doesn't get a flash of it at every app launch.
+  const [showIdlePill, setShowIdlePill] = useState<boolean | null>(null);
 
   useEffect(() => {
     let un1: (() => void) | undefined;
     let un2: (() => void) | undefined;
+    let un3: (() => void) | undefined;
     tauriListen<StateEvent>("whimpr://flowbar/state", (p) => setState(p.state)).then((u) => (un1 = u));
     tauriListen<WaveformEvent>("whimpr://audio/waveform", (p) => setBars(p.bars)).then((u) => (un2 = u));
+    // The Hub pushes this on every save, so the toggle applies without a restart.
+    tauriListen<SettingsEvent>("whimpr://settings/changed", (p) =>
+      setShowIdlePill(p.show_idle_pill !== false),
+    ).then((u) => (un3 = u));
+    readShowIdlePill().then(setShowIdlePill);
     return () => {
       un1?.();
       un2?.();
+      un3?.();
     };
   }, []);
 
   const recording = state === "recording" || state === "locked";
   const isIdle = state === "idle";
+  // Idle is the only state the toggle governs: recording, transcribing and the
+  // done/cancelled/error flashes are feedback for something the user just did.
+  const hidden = isIdle && showIdlePill !== true;
   const processing = state === "transcribing";
   const statusText =
     state === "transcribing"
@@ -148,6 +175,8 @@ export function FlowBar() {
     : recording
       ? { w: 250, h: 44 }
       : { w: 180, h: 36 };
+
+  if (hidden) return null;
 
   return (
     <div
