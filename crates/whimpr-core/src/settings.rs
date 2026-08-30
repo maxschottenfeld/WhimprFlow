@@ -36,6 +36,18 @@ pub struct Settings {
     pub anthropic_model: String,
     /// Play the record-start ping.
     pub sound_on_start: bool,
+    /// Show the Flow Bar pill while idle (nothing being dictated). Off means the
+    /// pill only appears once the hotkey is held, and disappears again after.
+    ///
+    /// `serde(default)` is load-bearing: `Settings::load` falls back to
+    /// `Settings::default()` on ANY deserialize error, so a settings.json written
+    /// before this field existed would otherwise reset every other setting.
+    #[serde(default = "default_true")]
+    pub show_idle_pill: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -47,6 +59,7 @@ impl Default for Settings {
             openai_base_url: String::new(),
             anthropic_model: "claude-haiku-4-5".to_string(),
             sound_on_start: true,
+            show_idle_pill: true,
         }
     }
 }
@@ -76,6 +89,26 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.cleanup_mode, CleanupMode::Local);
         assert_eq!(s.cleanup_level, CleanupLevel::Light);
+    }
+
+    /// A settings.json written before `show_idle_pill` existed must keep every
+    /// other value. Without the field's `serde(default)`, `load` would fail to
+    /// deserialize and silently hand back a wholly default Settings.
+    #[test]
+    fn older_settings_json_keeps_its_other_values() {
+        let legacy = r#"{
+            "cleanup_mode": "raw",
+            "cleanup_level": "high",
+            "openai_model": "gpt-4o-mini",
+            "openai_base_url": "",
+            "anthropic_model": "claude-haiku-4-5",
+            "sound_on_start": false
+        }"#;
+        let s: Settings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.cleanup_mode, CleanupMode::Raw);
+        assert_eq!(s.cleanup_level, CleanupLevel::High);
+        assert!(!s.sound_on_start);
+        assert!(s.show_idle_pill, "missing field defaults to visible");
     }
 
     #[test]

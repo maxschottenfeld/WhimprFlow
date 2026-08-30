@@ -240,6 +240,28 @@ export function SettingsPane({
       </Card>
 
       <Card style={{ marginBottom: 16 }}>
+        <SectionTitle sub="The pill that sits at the bottom of the screen.">Flow Bar</SectionTitle>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
+              Show the pill when you're not dictating
+            </div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+              Off hides it until you hold Fn, and hides it again when the text is pasted.
+            </div>
+          </div>
+          <Segmented
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+            value={settings.show_idle_pill ? "on" : "off"}
+            onChange={(v) => onChange({ ...settings, show_idle_pill: v === "on" })}
+          />
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: theme.textStrong }}>
             Play a sound when recording starts
