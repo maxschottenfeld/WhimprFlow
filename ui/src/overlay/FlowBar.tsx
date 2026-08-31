@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { palette, pillFill, geometry, font } from "../tokens/values";
+import { palette, pillFill, geometry, font, motion } from "../tokens/values";
 
 // Visual states, mirroring the Rust `BarState`.
 export type BarState =
@@ -159,6 +159,17 @@ export function FlowBar() {
   // Idle is the only state the toggle governs: recording, transcribing and the
   // done/cancelled/error flashes are feedback for something the user just did.
   const hidden = isIdle && showIdlePill !== true;
+
+  // Replay the pop-in every time the pill goes from nothing to something. Keyed
+  // on the hidden->visible edge rather than on "recording" so it fires once per
+  // dictation: the pill stays mounted through transcribing and done, and only
+  // the next hotkey press brings it back from nothing.
+  const wasHidden = useRef(hidden);
+  const [popCount, setPopCount] = useState(0);
+  useEffect(() => {
+    if (wasHidden.current && !hidden) setPopCount((n) => n + 1);
+    wasHidden.current = hidden;
+  }, [hidden]);
   const processing = state === "transcribing";
   const statusText =
     state === "transcribing"
@@ -191,6 +202,9 @@ export function FlowBar() {
       }}
     >
       <div
+        // Remount on each pop so the animation restarts; without a changing key
+        // the browser sees the same running animation and does nothing.
+        key={popCount}
         aria-label={`WhimprFlow ${state}`}
         style={{
           display: "flex",
@@ -206,6 +220,8 @@ export function FlowBar() {
           boxShadow: pillFill.shadow,
           color: palette.pillText,
           transition: `width ${geometry.morphMs}ms ${motionEase}, height ${geometry.morphMs}ms ${motionEase}`,
+          // popCount 0 is the app's own launch -- don't pop the pill at startup.
+          animation: popCount > 0 ? `whimpr-pop-in ${motion.springDurationS}s ${popEase} both` : undefined,
           overflow: "hidden",
           fontSize: 13,
         }}
@@ -229,3 +245,6 @@ export function FlowBar() {
 }
 
 const motionEase = "cubic-bezier(0.05,0.6,0.4,0.95)";
+// Back-out: undershoots at the start, overshoots near the end. `motion.ease` is
+// the morph curve and does neither, which is why this is its own value.
+const popEase = "cubic-bezier(0.34, 1.4, 0.5, 1)";
