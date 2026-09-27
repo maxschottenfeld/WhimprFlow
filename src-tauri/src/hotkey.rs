@@ -25,7 +25,7 @@ mod imp {
     use std::path::PathBuf;
     use super::DictEntryDto;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -122,6 +122,14 @@ mod imp {
     /// user has long since let go of Shift by the time the transcript exists.
     static MATH_MODE: AtomicBool = AtomicBool::new(false);
     static CAPTURE: OnceLock<Mutex<Option<whimpr_audio::CaptureHandle>>> = OnceLock::new();
+    /// Bumped by every capture start, stop and discard, under the `CAPTURE` lock.
+    /// `whimpr_audio::start` blocks until the stream is playing (~110-180 ms), so a
+    /// quick tap can stop or discard before the handle exists; the capture thread
+    /// then sees the generation moved and closes the late handle instead of storing
+    /// it. Before this, the late handle was stored with nothing left to stop it and
+    /// kept the mic open until the next dictation replaced it: two such streams were
+    /// still delivering callbacks 23 and 60 minutes later (stable logs, 2026-09-24/25).
+    static CAPTURE_GEN: AtomicU64 = AtomicU64::new(0);
     static ASR: OnceLock<Arc<whimpr_asr::WhisperEngine>> = OnceLock::new();
     static OPENAI: OnceLock<Mutex<Option<whimpr_cleanup::OpenAiProvider>>> = OnceLock::new();
     static ANTHROPIC: OnceLock<Mutex<Option<whimpr_cleanup::AnthropicProvider>>> = OnceLock::new();
@@ -910,6 +918,10 @@ mod imp {
                 // arm), so this is effectively the key-down instant -- see
                 // whimpr_audio::CaptureStartTiming.
                 let key_down_at = Instant::now();
+                let generation = {
+                    let _slot = CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+                    CAPTURE_GEN.fetch_add(1, Ordering::SeqCst) + 1
+                };
                 let app_thread = app.clone();
                 std::thread::spawn(move || {
                     let app_cb = app_thread.clone();
@@ -921,7 +933,17 @@ mod imp {
                         );
                     }) {
                         Ok(handle) => {
-                            *CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(handle);
+                            let mut slot = CAPTURE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+                            if CAPTURE_GEN.load(Ordering::SeqCst) == generation {
+                                *slot = Some(handle);
+                            } else {
+                                drop(slot);
+                                eprintln!(
+                                    "[whimpr] mic finished opening after the capture was \
+                                     stopped; closing it"
+                                );
+                                let _ = handle.stop();
+                            }
                         }
                         Err(e) => eprintln!("[whimpr] mic capture failed to start: {e}"),
                     }
@@ -930,7 +952,11 @@ mod imp {
             // Stop the mic, transcribe the buffered audio, and advance the machine.
             Action::StopCaptureAndFinalize { session } => {
                 let app2 = app.clone();
-                let handle = CAPTURE.get().and_then(|slot| slot.lock().unwrap().take());
+                let handle = CAPTURE.get().and_then(|slot| {
+                    let mut slot = slot.lock().unwrap();
+                    CAPTURE_GEN.fetch_add(1, Ordering::SeqCst);
+                    slot.take()
+                });
                 std::thread::spawn(move || {
                     // Whatever happens, return the pill to idle (done -> idle).
                     let finish =
@@ -1115,7 +1141,12 @@ mod imp {
             }
             Action::DiscardCapture { .. } => {
                 if let Some(slot) = CAPTURE.get() {
-                    if let Some(handle) = slot.lock().unwrap().take() {
+                    let handle = {
+                        let mut slot = slot.lock().unwrap();
+                        CAPTURE_GEN.fetch_add(1, Ordering::SeqCst);
+                        slot.take()
+                    };
+                    if let Some(handle) = handle {
                         let _ = handle.stop();
                     }
                 }
