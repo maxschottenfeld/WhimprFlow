@@ -1,6 +1,6 @@
 //! Microphone capture for WhimprFlow.
 //!
-//! [`start`] opens the default input device and streams audio. While it runs it
+//! [`start`] opens the input device (see [`choose_input_device`]) and streams audio. While it runs it
 //! downmixes to mono, accumulates the whole utterance, and invokes a throttled
 //! callback with a small rolling window of RMS levels (0..1) for the pill's live
 //! waveform. [`CaptureHandle::stop`] returns the accumulated mono samples plus the
@@ -89,7 +89,8 @@ impl Drop for CaptureHandle {
     }
 }
 
-/// Start capturing from the default input device.
+/// Start capturing from the default input device, or the built-in mic when the
+/// default is Bluetooth (see [`choose_input_device`]).
 ///
 /// `key_down_at` is the instant capture-start latency should be measured from —
 /// normally the moment the push-to-talk key went down. Callers with no such
@@ -121,7 +122,7 @@ where
         let ms_since = move |t: Instant| t.duration_since(key_down_at).as_secs_f64() * 1000.0;
 
         let host = cpal::default_host();
-        let device = match host.default_input_device() {
+        let device = match choose_input_device(&host) {
             Some(d) => d,
             None => {
                 let _ = ready_tx.send(Err(anyhow::anyhow!("no default input device")));
@@ -261,6 +262,206 @@ where
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!("capture thread exited before starting")),
+    }
+}
+
+/// The input device to capture from: the system default, unless that is a
+/// Bluetooth mic and a built-in one exists.
+///
+/// Connected AirPods become the default input even when nothing is using them.
+/// Measured 2026-09-27 with `examples/mic-open-latency.rs`, AirPods as default:
+/// the AirPods mic delivered its first non-zero sample a median 732 ms after
+/// opening, the built-in mic 176 ms (n=19 each), so the first second of every
+/// dictation was lost. Opening the built-in mic by transport type was not slowed
+/// down by the AirPods being the default.
+///
+/// Falls back to the default when there is no built-in input (lid closed on a
+/// laptop, or a desktop Mac), so dictation keeps working, just on the slow path.
+fn choose_input_device(host: &cpal::Host) -> Option<cpal::Device> {
+    let default = host.default_input_device();
+    #[cfg(target_os = "macos")]
+    if coreaudio::default_input_is_bluetooth() {
+        let builtin = coreaudio::builtin_input_name().and_then(|want| {
+            host.input_devices()
+                .ok()?
+                .find(|d| d.name().map(|n| n == want).unwrap_or(false))
+        });
+        let default_name = default.as_ref().and_then(|d| d.name().ok());
+        match builtin {
+            Some(d) => {
+                eprintln!(
+                    "[whimpr-audio] default input {default_name:?} is Bluetooth; using built-in mic"
+                );
+                return Some(d);
+            }
+            None => eprintln!(
+                "[whimpr-audio] default input {default_name:?} is Bluetooth and no built-in mic \
+                 was found; using it anyway"
+            ),
+        }
+    }
+    default
+}
+
+/// Just enough CoreAudio to read a device's transport type and name. cpal
+/// enumerates devices by name only, and matching `"MacBook Air Microphone"` by
+/// name would break on any other Mac.
+#[cfg(target_os = "macos")]
+pub mod coreaudio {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct PropAddr {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    const fn fourcc(s: &[u8; 4]) -> u32 {
+        ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | s[3] as u32
+    }
+
+    const SYSTEM_OBJECT: u32 = 1;
+    const SCOPE_GLOBAL: u32 = fourcc(b"glob");
+    const SCOPE_INPUT: u32 = fourcc(b"inpt");
+    const SEL_DEVICES: u32 = fourcc(b"dev#");
+    const SEL_DEFAULT_INPUT: u32 = fourcc(b"dIn ");
+    const SEL_TRANSPORT: u32 = fourcc(b"tran");
+    const SEL_NAME: u32 = fourcc(b"lnam");
+    const SEL_STREAMS: u32 = fourcc(b"stm#");
+    pub const TRANSPORT_BUILTIN: u32 = fourcc(b"bltn");
+    pub const TRANSPORT_BLUETOOTH: u32 = fourcc(b"blue");
+    pub const TRANSPORT_BLUETOOTH_LE: u32 = fourcc(b"blea");
+    const CF_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectGetPropertyDataSize(
+            id: u32,
+            addr: *const PropAddr,
+            qual_size: u32,
+            qual: *const c_void,
+            out_size: *mut u32,
+        ) -> i32;
+        fn AudioObjectGetPropertyData(
+            id: u32,
+            addr: *const PropAddr,
+            qual_size: u32,
+            qual: *const c_void,
+            io_size: *mut u32,
+            out: *mut c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringGetCString(s: *const c_void, buf: *mut u8, len: isize, enc: u32) -> u8;
+        fn CFRelease(p: *const c_void);
+    }
+
+    fn addr(selector: u32, scope: u32) -> PropAddr {
+        PropAddr { selector, scope, element: 0 }
+    }
+
+    fn prop_size(id: u32, sel: u32, scope: u32) -> Option<u32> {
+        let mut size = 0u32;
+        let st = unsafe {
+            AudioObjectGetPropertyDataSize(id, &addr(sel, scope), 0, std::ptr::null(), &mut size)
+        };
+        (st == 0).then_some(size)
+    }
+
+    fn prop_u32(id: u32, sel: u32, scope: u32) -> Option<u32> {
+        let mut v = 0u32;
+        let mut size = 4u32;
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                id,
+                &addr(sel, scope),
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut v as *mut u32 as *mut c_void,
+            )
+        };
+        (st == 0).then_some(v)
+    }
+
+    /// All CoreAudio device ids.
+    pub fn devices() -> Vec<u32> {
+        let Some(size) = prop_size(SYSTEM_OBJECT, SEL_DEVICES, SCOPE_GLOBAL) else {
+            return vec![];
+        };
+        let mut ids = vec![0u32; size as usize / 4];
+        let mut io = size;
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &addr(SEL_DEVICES, SCOPE_GLOBAL),
+                0,
+                std::ptr::null(),
+                &mut io,
+                ids.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if st != 0 {
+            return vec![];
+        }
+        ids.truncate(io as usize / 4);
+        ids
+    }
+
+    pub fn default_input() -> Option<u32> {
+        prop_u32(SYSTEM_OBJECT, SEL_DEFAULT_INPUT, SCOPE_GLOBAL)
+    }
+
+    pub fn transport_type(id: u32) -> Option<u32> {
+        prop_u32(id, SEL_TRANSPORT, SCOPE_GLOBAL)
+    }
+
+    pub fn has_input(id: u32) -> bool {
+        prop_size(id, SEL_STREAMS, SCOPE_INPUT).is_some_and(|s| s > 0)
+    }
+
+    pub fn name(id: u32) -> Option<String> {
+        let mut cf: *const c_void = std::ptr::null();
+        let mut size = std::mem::size_of::<*const c_void>() as u32;
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                id,
+                &addr(SEL_NAME, SCOPE_GLOBAL),
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut cf as *mut _ as *mut c_void,
+            )
+        };
+        if st != 0 || cf.is_null() {
+            return None;
+        }
+        let mut buf = [0u8; 256];
+        let ok = unsafe { CFStringGetCString(cf, buf.as_mut_ptr(), buf.len() as isize, CF_UTF8) };
+        unsafe { CFRelease(cf) };
+        if ok == 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+
+    pub fn default_input_is_bluetooth() -> bool {
+        default_input()
+            .and_then(transport_type)
+            .is_some_and(|t| t == TRANSPORT_BLUETOOTH || t == TRANSPORT_BLUETOOTH_LE)
+    }
+
+    /// Name of the first input device whose transport type is built-in.
+    pub fn builtin_input_name() -> Option<String> {
+        devices()
+            .into_iter()
+            .filter(|&id| has_input(id))
+            .find(|&id| transport_type(id) == Some(TRANSPORT_BUILTIN))
+            .and_then(name)
     }
 }
 
