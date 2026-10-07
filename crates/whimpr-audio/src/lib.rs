@@ -245,7 +245,7 @@ where
 
         // Keep the stream alive on this thread until asked to stop.
         let _ = stop_rx.recv();
-        drop(stream);
+        stop_stream(stream);
 
         let samples = std::mem::take(&mut *buffer.lock().unwrap());
         Some(CaptureResult {
@@ -277,6 +277,28 @@ where
 ///
 /// Falls back to the default when there is no built-in input (lid closed on a
 /// laptop, or a desktop Mac), so dictation keeps working, just on the slow path.
+/// Stop a stream, then drop it. Dropping alone is not enough on macOS.
+///
+/// cpal 0.15.3 registers a disconnect listener on any device that did not come
+/// from `default_input_device()`. The listener's closure holds a clone of the
+/// stream and the stream holds the listener, so the drop never frees it: the
+/// audio unit keeps running and the data callback keeps appending to the capture
+/// buffer. [`choose_input_device`] returns exactly such a device whenever the
+/// default input is Bluetooth, so with AirPods connected every dictation left a
+/// mic stream running. Over 2026-10-06 that grew the stable app to 20.3 GB
+/// before macOS killed it (`JetsamEvent-2026-10-06-230400.ips`).
+///
+/// `pause()` stops the audio unit directly, which ends the callbacks whether or
+/// not the stream is ever freed. The cycle itself still leaks the stopped
+/// stream object, a few KB per dictation. `examples/stream-leak.rs` measures
+/// both paths.
+pub fn stop_stream(stream: cpal::Stream) {
+    if let Err(e) = stream.pause() {
+        eprintln!("[whimpr-audio] stream pause failed: {e}");
+    }
+    drop(stream);
+}
+
 fn choose_input_device(host: &cpal::Host) -> Option<cpal::Device> {
     let default = host.default_input_device();
     #[cfg(target_os = "macos")]
