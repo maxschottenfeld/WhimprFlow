@@ -32,3 +32,10 @@ tracing = "0.1"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Proc-macro dylibs are loaded by rustc at build time, and `strip = true` above
+# reaches them too. On macOS 27.0.1 the stripped dylibs fail dlopen with
+# "mis-aligned LINKEDIT string pool" (2026-10-06), which breaks every release
+# build. The shipped binaries are still stripped; only build-time crates aren't.
+[profile.release.build-override]
+strip = false
